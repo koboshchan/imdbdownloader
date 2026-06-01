@@ -22,6 +22,13 @@ size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* userp) {
     return size * nmemb;
 }
 
+// Strip leading non-JSON content (e.g. PHP warnings) — find first '{' or '['
+std::string stripToJSON(const std::string& s) {
+    size_t p = s.find_first_of("{[");
+    if (p == std::string::npos) return s;
+    return s.substr(p);
+}
+
 // ── Write-to-FILE callback (for binary subtitle downloads) ───────────────────
 size_t WriteFileCallback(void* contents, size_t size, size_t nmemb, void* userp) {
     return fwrite(contents, size, nmemb, (FILE*)userp);
@@ -217,22 +224,25 @@ std::string extractSubtitleArchive(const std::string& archivePath, const std::st
     return findEpisodeSubtitle(extractDir, episode);
 }
 
-// Strip trailing year "(YYYY)" or " YYYY" from a title for subtitle lookup
+// Strip trailing year "(YYYY)" or " YYYY" and trailing punctuation from a title
 std::string stripYear(const std::string& title) {
-    // Match " YYYY" or " (YYYY)" at the end
-    if (title.size() >= 5) {
-        // " YYYY" form
-        std::string end4 = title.substr(title.size() - 4);
-        if (title[title.size() - 5] == ' ' &&
-            std::all_of(end4.begin(), end4.end(), ::isdigit))
-            return title.substr(0, title.size() - 5);
-        // " (YYYY)" form
-        if (title.size() >= 7 && title.substr(title.size() - 6) == ")" ) {
-            size_t p = title.rfind(" (");
-            if (p != std::string::npos) return title.substr(0, p);
+    std::string t = title;
+    // Strip " YYYY" at end
+    if (t.size() >= 5) {
+        std::string end4 = t.substr(t.size() - 4);
+        if (t[t.size() - 5] == ' ' && std::all_of(end4.begin(), end4.end(), ::isdigit))
+            t = t.substr(0, t.size() - 5);
+        // Strip " (YYYY)" at end
+        else if (t.size() >= 7 && t.back() == ')') {
+            size_t p = t.rfind(" (");
+            if (p != std::string::npos && std::all_of(t.begin() + p + 2, t.end() - 1, ::isdigit))
+                t = t.substr(0, p);
         }
     }
-    return title;
+    // Strip trailing non-alphanumeric chars (e.g. trailing period in "Your Name.")
+    while (!t.empty() && !std::isalnum((unsigned char)t.back()))
+        t.pop_back();
+    return t;
 }
 
 // After downloading a video to `outputBase`.mp4, fetch & save its subtitle.
@@ -406,7 +416,7 @@ void handleShow(const std::string& imdb_id, const std::string& title, const json
         std::cin >> chosen_ep;
 
         std::string ep_url = "https://streamdata.vaplayer.ru/api.php?imdb=" + imdb_id + "&type=tv&season=" + chosen_season + "&episode=" + std::to_string(chosen_ep);
-        json ep_res = json::parse(fetchURL(ep_url));
+        json ep_res = json::parse(stripToJSON(fetchURL(ep_url)));
         auto urls = ep_res["data"]["stream_urls"];
 
         if (!urls.empty()) {
@@ -426,7 +436,7 @@ void handleShow(const std::string& imdb_id, const std::string& title, const json
                 std::string ep_url = "https://streamdata.vaplayer.ru/api.php?imdb=" + imdb_id + "&type=tv&season=" + season_num + "&episode=" + std::to_string(ep);
 
                 try {
-                    json ep_res = json::parse(fetchURL(ep_url));
+                    json ep_res = json::parse(stripToJSON(fetchURL(ep_url)));
                     auto urls = ep_res["data"]["stream_urls"];
                     if (!urls.empty()) {
                         std::string dir_cmd = "mkdir -p \"./" + cleanTitle + "/Season_" + season_num + "\"";
@@ -487,12 +497,12 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    json res = json::parse(raw_json);
+    json res = json::parse(stripToJSON(raw_json));
     std::string title = res["data"]["title"].get<std::string>();
 
     if (res["data"]["eps"].is_boolean() && res["data"]["eps"].get<bool>() == false) {
         std::string movie_url = "https://streamdata.vaplayer.ru/api.php?imdb=" + imdb_id + "&type=movie";
-        json movie_res = json::parse(fetchURL(movie_url));
+        json movie_res = json::parse(stripToJSON(fetchURL(movie_url)));
         handleMovie(title, movie_res["data"]["stream_urls"]);
     } else {
         handleShow(imdb_id, title, res["data"]["eps"]);
