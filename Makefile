@@ -10,7 +10,7 @@ $(TARGET): $(SRC)
 	$(CXX) $(CXXFLAGS) $(SRC) -o $(TARGET) $(LDFLAGS)
 
 install: $(TARGET)
-	install -m 755 $(TARGET) $(HOME)/bin/$(TARGET)
+	install -m 755 $(TARGET) /usr/local/bin/$(TARGET)
 
 clean:
 	rm -f $(TARGET)
