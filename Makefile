@@ -9,5 +9,8 @@ all: $(TARGET)
 $(TARGET): $(SRC)
 	$(CXX) $(CXXFLAGS) $(SRC) -o $(TARGET) $(LDFLAGS)
 
+install: $(TARGET)
+	install -m 755 $(TARGET) $(HOME)/bin/$(TARGET)
+
 clean:
 	rm -f $(TARGET)
