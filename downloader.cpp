@@ -173,7 +173,7 @@ std::string findEpisodeSubtitle(const std::string& extractDir, int episode) {
     std::string ep1  = std::to_string(episode);  // "2"
 
     // List all subtitle files in the dir
-    std::string listCmd = "find \"" + extractDir + "\" -maxdepth 2 \\( -name '*.srt' -o -name '*.sub' \\) 2>/dev/null";
+    std::string listCmd = "find \"" + extractDir + "\" -maxdepth 5 \\( -name '*.srt' -o -name '*.sub' \\) 2>/dev/null";
     FILE* pipe = popen(listCmd.c_str(), "r");
     if (!pipe) return "";
 
@@ -213,8 +213,8 @@ std::string extractSubtitleArchive(const std::string& archivePath, const std::st
     std::string extractDir = "/tmp/imdbsub_" + subId + "/";
     std::system(("rm -rf \"" + extractDir + "\" && mkdir -p \"" + extractDir + "\"").c_str());
 
-    // unar (The Unarchiver) handles RAR3/RAR5 and zip better than p7zip on macOS
-    std::string extractCmd = "unar -D -force-overwrite \"" + archivePath + "\" -o \"" + extractDir + "\" >/dev/null 2>&1";
+    // unar flag: -D on macOS (The Unarchiver), -no-directory on some Linux builds; try both forms
+    std::string extractCmd = "unar -D -no-directory -force-overwrite \"" + archivePath + "\" -o \"" + extractDir + "\" >/dev/null 2>&1";
     int rc = std::system(extractCmd.c_str());
     if (rc != 0) {
         // fallback to unzip for plain zip files
