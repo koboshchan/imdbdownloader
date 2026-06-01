@@ -17,13 +17,13 @@ brew install curl nlohmann-json yt-dlp ffmpeg unar
 ### Linux (Debian/Ubuntu)
 
 ```bash
-sudo apt install libcurl4-openssl-dev nlohmann-json3-dev
+sudo apt install libcurl4-openssl-dev nlohmann-json3-dev unar ffmpeg
 ```
 
 ### Linux (Fedora/RHEL)
 
 ```bash
-sudo dnf install libcurl-devel json-devel
+sudo dnf install libcurl-devel json-devel unar ffmpeg
 ```
 
 ## Build
