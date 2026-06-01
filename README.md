@@ -18,12 +18,14 @@ brew install curl nlohmann-json yt-dlp ffmpeg unar
 
 ```bash
 sudo apt install libcurl4-openssl-dev nlohmann-json3-dev unar ffmpeg
+pip install yt-dlp
 ```
 
 ### Linux (Fedora/RHEL)
 
 ```bash
 sudo dnf install libcurl-devel json-devel unar ffmpeg
+pip install yt-dlp
 ```
 
 ## Build
