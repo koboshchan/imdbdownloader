@@ -360,6 +360,176 @@ void downloadSubtitle(const std::string& title, int season, int episode, const s
     }
 }
 
+// ── OpenSubtitles subtitle download (for movies) ─────────────────────────────
+
+// Map English language name to ISO 639-2/B code for OpenSubtitles
+std::string langToISO639(const std::string& lang) {
+    static const std::vector<std::pair<std::string,std::string>> map = {
+        {"English","eng"},{"Hungarian","hun"},{"French","fre"},{"German","ger"},
+        {"Spanish","spa"},{"Italian","ita"},{"Portuguese","por"},{"Russian","rus"},
+        {"Japanese","jpn"},{"Chinese","chi"},{"Korean","kor"},{"Dutch","dut"},
+        {"Polish","pol"},{"Swedish","swe"},{"Norwegian","nor"},{"Danish","dan"},
+        {"Finnish","fin"},{"Czech","cze"},{"Romanian","rum"},{"Turkish","tur"},
+        {"Arabic","ara"},{"Hebrew","heb"},{"Greek","ell"},{"Ukrainian","ukr"},
+    };
+    for (auto& [name, code] : map)
+        if (name == lang) return code;
+    return "eng"; // fallback
+}
+
+std::string fetchOpenSubtitles(const std::string& url) {
+    CURL* curl = curl_easy_init();
+    std::string buffer;
+    if (curl) {
+        struct curl_slist* headers = NULL;
+        headers = curl_slist_append(headers, "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:153.0) Gecko/20100101 Firefox/153.0");
+        headers = curl_slist_append(headers, "X-User-Agent: trailers.to-UA");
+        headers = curl_slist_append(headers, "Accept: */*");
+        headers = curl_slist_append(headers, "Referer: https://brightpathsignals.com/");
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buffer);
+        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+        curl_easy_perform(curl);
+        curl_slist_free_all(headers);
+        curl_easy_cleanup(curl);
+    }
+    return buffer;
+}
+
+bool downloadWyzie(const std::string& url, const std::string& filepath) {
+    CURL* curl = curl_easy_init();
+    if (!curl) return false;
+    FILE* fp = fopen(filepath.c_str(), "wb");
+    if (!fp) { curl_easy_cleanup(curl); return false; }
+    struct curl_slist* headers = NULL;
+    headers = curl_slist_append(headers, "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:153.0) Gecko/20100101 Firefox/153.0");
+    headers = curl_slist_append(headers, "Accept: */*");
+    headers = curl_slist_append(headers, "Referer: https://brightpathsignals.com/");
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteFileCallback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    CURLcode res = curl_easy_perform(curl);
+    fclose(fp);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    return res == CURLE_OK;
+}
+
+// Download subtitle for a movie via OpenSubtitles search + wyzie.io delivery
+void downloadSubtitleMovie(const std::string& imdb_id_raw, const std::string& outputBase) {
+    if (g_noSubs) return;
+
+    // Strip leading "tt" and any leading zeros for OpenSubtitles imdbid path segment
+    std::string imdb_num = imdb_id_raw;
+    if (imdb_num.size() > 2 && imdb_num.substr(0,2) == "tt")
+        imdb_num = imdb_num.substr(2);
+    // Remove leading zeros
+    imdb_num.erase(0, imdb_num.find_first_not_of('0'));
+
+    std::string langCode = langToISO639(g_subLang);
+    std::string searchURL = "https://rest.opensubtitles.org/search/imdbid-" + imdb_num +
+                            "/sublanguageid-" + langCode;
+
+    std::cout << "\n[Subs] Searching OpenSubtitles for " << g_subLang << " subtitles..." << std::endl;
+    std::string raw = fetchOpenSubtitles(searchURL);
+    if (raw.empty()) { std::cerr << "[Subs] OpenSubtitles request failed.\n"; return; }
+
+    json results;
+    try { results = json::parse(raw); } catch (...) { std::cerr << "[Subs] Failed to parse OpenSubtitles response.\n"; return; }
+    if (!results.is_array() || results.empty()) { std::cerr << "[Subs] No subtitles found on OpenSubtitles.\n"; return; }
+
+    // Pick best result: prefer SubHD=1, then sort by download count
+    json best;
+    int bestScore = -1;
+    for (auto& s : results) {
+        int score = std::stoi(s.value("SubDownloadsCnt","0"))
+                  + (s.value("SubHD","0") == "1" ? 1000000 : 0)
+                  + (s.value("SubFromTrusted","0") == "1" ? 500000 : 0);
+        if (score > bestScore) { bestScore = score; best = s; }
+    }
+
+    std::string fileID  = best.value("IDSubtitleFile","");
+    std::string dlLink  = best.value("SubDownloadLink","");
+    std::string subFile = best.value("SubFileName","subtitle");
+    if (fileID.empty() || dlLink.empty()) { std::cerr << "[Subs] Missing subtitle file info.\n"; return; }
+
+    // Extract the 8-char VRF hash from SubDownloadLink (e.g. "vrf-19cc0c55")
+    std::string vrfHash;
+    size_t vrfPos = dlLink.find("vrf-");
+    if (vrfPos != std::string::npos) {
+        vrfPos += 4; // skip "vrf-"
+        size_t vrfEnd = dlLink.find('/', vrfPos);
+        vrfHash = dlLink.substr(vrfPos, vrfEnd == std::string::npos ? 8 : vrfEnd - vrfPos);
+    }
+
+    std::cout << "[Subs] Found: " << subFile << std::endl;
+
+    // Build wyzie.io download URL
+    std::string tmpSrt = "/tmp/imdbsub_" + fileID + ".srt";
+    bool downloaded = false;
+
+    if (!vrfHash.empty()) {
+        std::string wyzieURL = "https://sub.wyzie.io/c/" + vrfHash + "/id/" + fileID +
+                               "?format=srt&encoding=UTF-8";
+        downloaded = downloadWyzie(wyzieURL, tmpSrt);
+        // Validate (wyzie.io may return an error JSON instead of SRT)
+        if (downloaded) {
+            FILE* f = fopen(tmpSrt.c_str(), "r");
+            char buf[16] = {};
+            size_t n = 0;
+            if (f) { n = fread(buf, 1, 15, f); fclose(f); }
+            if (n == 0 || buf[0] == '{' || buf[0] == '[') { // empty or JSON error
+                std::remove(tmpSrt.c_str());
+                downloaded = false;
+            }
+        }
+    }
+
+    // Fallback: download the .gz directly from OpenSubtitles
+    if (!downloaded) {
+        std::string tmpGz = "/tmp/imdbsub_" + fileID + ".gz";
+        if (downloadBinaryFile(dlLink, tmpGz)) {
+            std::string gunzipCmd = "gunzip -c \"" + tmpGz + "\" > \"" + tmpSrt + "\" 2>/dev/null";
+            downloaded = (std::system(gunzipCmd.c_str()) == 0);
+            std::remove(tmpGz.c_str());
+        }
+    }
+
+    if (!downloaded) { std::cerr << "[Subs] Subtitle download failed.\n"; return; }
+
+    std::string dest = outputBase + ".srt";
+    if (std::rename(tmpSrt.c_str(), dest.c_str()) != 0) {
+        std::system(("cp \"" + tmpSrt + "\" \"" + dest + "\"").c_str());
+        std::remove(tmpSrt.c_str());
+    }
+    std::cout << "[Subs] Saved: " << dest << std::endl;
+
+    // Optionally mux into video
+    if (g_embedSubs) {
+        std::string videoPath = outputBase + ".mp4";
+        std::string tmpMux    = outputBase + "_mux.mp4";
+        std::string muxCmd = "ffmpeg -y -i \"" + videoPath + "\" -i \"" + dest + "\""
+                             " -c:v copy -c:a copy -c:s mov_text"
+                             " -metadata:s:s:0 language=" + g_subLang +
+                             " \"" + tmpMux + "\" 2>&1";
+        std::cout << "[Subs] Muxing subtitle into video..." << std::endl;
+        if (std::system(muxCmd.c_str()) == 0) {
+            std::remove(videoPath.c_str());
+            if (std::rename(tmpMux.c_str(), videoPath.c_str()) != 0)
+                std::system(("mv \"" + tmpMux + "\" \"" + videoPath + "\"").c_str());
+            std::remove(dest.c_str());
+            std::cout << "[Subs] Embedded into: " << videoPath << std::endl;
+        } else {
+            std::cerr << "[Subs] ffmpeg mux failed; keeping standalone .srt\n";
+            std::remove(tmpMux.c_str());
+        }
+    }
+}
+
 std::string sanitizeFilename(std::string name) {
     std::replace(name.begin(), name.end(), ' ', '_');
     name.erase(std::remove_if(name.begin(), name.end(), [](char c) {
@@ -378,7 +548,7 @@ void downloadStream(const std::string& m3u8_url, const std::string& output_path)
     std::system(cmd.c_str());
 }
 
-void handleMovie(const std::string& title, const json& stream_urls) {
+void handleMovie(const std::string& imdb_id, const std::string& title, const json& stream_urls) {
     if (stream_urls.empty()) {
         std::cerr << "No streams found for this movie." << std::endl;
         return;
@@ -388,7 +558,7 @@ void handleMovie(const std::string& title, const json& stream_urls) {
     std::cout << "\nFound Movie: " << title << std::endl;
     std::cout << "Downloading to " << filename << "..." << std::endl;
     downloadStream(stream_urls[0].get<std::string>(), filename);
-    downloadSubtitle(title, 0, 0, base);
+    downloadSubtitleMovie(imdb_id, base);  // OpenSubtitles + wyzie.io for movies
 }
 
 void handleShow(const std::string& imdb_id, const std::string& title, const json& eps_data) {
@@ -503,7 +673,7 @@ int main(int argc, char* argv[]) {
     if (res["data"]["eps"].is_boolean() && res["data"]["eps"].get<bool>() == false) {
         std::string movie_url = "https://streamdata.vaplayer.ru/api.php?imdb=" + imdb_id + "&type=movie";
         json movie_res = json::parse(stripToJSON(fetchURL(movie_url)));
-        handleMovie(title, movie_res["data"]["stream_urls"]);
+        handleMovie(imdb_id, title, movie_res["data"]["stream_urls"]);
     } else {
         handleShow(imdb_id, title, res["data"]["eps"]);
     }
