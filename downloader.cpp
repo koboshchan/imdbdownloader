@@ -321,6 +321,9 @@ void downloadSubtitle(const std::string& title, int season, int episode, const s
             std::cout << "[Subs] Saved: " << dest << std::endl;
         } else {
             std::cerr << "[Subs] No .srt/.sub found inside archive.\n";
+            std::system(("rm -rf /tmp/imdbsub_" + subId + "/").c_str());
+            std::remove(tmpPath.c_str());
+            return;
         }
         std::system(("rm -rf /tmp/imdbsub_" + subId + "/").c_str());
     } else {
@@ -330,10 +333,7 @@ void downloadSubtitle(const std::string& title, int season, int episode, const s
             std::system(("cp \"" + tmpPath + "\" \"" + dest + "\"").c_str());
         std::cout << "[Subs] Saved: " << dest << std::endl;
         std::remove(tmpPath.c_str());
-        return;
     }
-
-    std::remove(tmpPath.c_str());
 
     // 5. Optionally mux subtitle into the video with ffmpeg
     if (g_embedSubs) {
