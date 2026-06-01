@@ -4,24 +4,41 @@ Downloads movies and TV shows by IMDB ID using yt-dlp and ffmpeg. Subtitles are 
 
 ## Requirements
 
-- macOS with Homebrew
 - `yt-dlp` and `ffmpeg` in PATH
 - `unar` for TV show subtitle extraction
+- `libcurl` and `nlohmann/json` development headers
+
+### macOS
 
 ```bash
 brew install curl nlohmann-json yt-dlp ffmpeg unar
+```
+
+### Linux (Debian/Ubuntu)
+
+```bash
+sudo apt install libcurl4-openssl-dev nlohmann-json3-dev
+```
+
+### Linux (Fedora/RHEL)
+
+```bash
+sudo dnf install libcurl-devel json-devel
 ```
 
 ## Build
 
 ```bash
 make
+sudo make install
 ```
+
+The Makefile auto-detects Homebrew paths on macOS and uses `pkg-config` on Linux.
 
 ## Usage
 
 ```bash
-./imdbdownloader <IMDB_ID> [options]
+imdbdownloader <IMDB_ID> [options]
 ```
 
 **Options:**
@@ -36,17 +53,17 @@ make
 
 Download a movie:
 ```bash
-./imdbdownloader tt5311514
+imdbdownloader tt5311514
 ```
 
 Download a movie with embedded subtitles:
 ```bash
-./imdbdownloader tt5311514 --embed-subs
+imdbdownloader tt5311514 --embed-subs
 ```
 
 Download a TV show (prompts for episode selection):
 ```bash
-./imdbdownloader tt0480489
+imdbdownloader tt0480489
 ```
 
 ## Output
