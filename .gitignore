@@ -1,0 +1,10 @@
+# Build output
+imdbdownloader
+
+# macOS
+.DS_Store
+
+# Downloaded media
+*.mp4
+*.mkv
+*.ts
