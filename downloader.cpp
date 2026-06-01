@@ -13,6 +13,7 @@ using json = nlohmann::json;
 
 // ── Global flags ─────────────────────────────────────────────────────────────
 bool g_noSubs = false;
+bool g_embedSubs = false;
 std::string g_subLang = "English"; // preferred subtitle language (English name)
 
 // ── Generic write-to-string callback ─────────────────────────────────────────
@@ -323,6 +324,30 @@ void downloadSubtitle(const std::string& title, int season, int episode, const s
     }
 
     std::remove(tmpPath.c_str());
+
+    // 5. Optionally mux subtitle into the video with ffmpeg
+    if (g_embedSubs) {
+        std::string videoPath = outputBase + ".mp4";
+        std::string srtPath   = outputBase + ".srt";
+        std::string tmpMux    = outputBase + "_mux.mp4";
+        // Soft-subtitle mux: copy all streams, add subtitle track as mov_text
+        std::string muxCmd = "ffmpeg -y -i \"" + videoPath + "\" -i \"" + srtPath + "\""
+                             " -c:v copy -c:a copy -c:s mov_text"
+                             " -metadata:s:s:0 language=" + g_subLang +
+                             " \"" + tmpMux + "\" 2>&1";
+        std::cout << "[Subs] Muxing subtitle into video..." << std::endl;
+        int rc = std::system(muxCmd.c_str());
+        if (rc == 0) {
+            std::remove(videoPath.c_str());
+            if (std::rename(tmpMux.c_str(), videoPath.c_str()) != 0)
+                std::system(("mv \"" + tmpMux + "\" \"" + videoPath + "\"").c_str());
+            std::remove(srtPath.c_str());
+            std::cout << "[Subs] Embedded into: " << videoPath << std::endl;
+        } else {
+            std::cerr << "[Subs] ffmpeg mux failed; keeping standalone .srt\n";
+            std::remove(tmpMux.c_str());
+        }
+    }
 }
 
 std::string sanitizeFilename(std::string name) {
@@ -431,10 +456,14 @@ int main(int argc, char* argv[]) {
     std::string imdb_id = argv[1];
 
     if (imdb_id == "--help" || imdb_id == "-h") {
-        std::cout << "Usage: " << argv[0] << " <IMDB_ID> [--no-subs] [--lang <Language>]\n"
+        std::cout << "Usage: " << argv[0] << " <IMDB_ID> [--no-subs] [--embed-subs] [--lang <Language>]\n"
                   << "  e.g.: " << argv[0] << " tt0480489\n"
+                  << "        " << argv[0] << " tt0480489 --embed-subs\n"
                   << "        " << argv[0] << " tt0480489 --lang English\n"
-                  << "        " << argv[0] << " tt0480489 --no-subs\n";
+                  << "        " << argv[0] << " tt0480489 --no-subs\n"
+                  << "\n  --embed-subs  Mux subtitle track into the .mp4 using ffmpeg (removes .srt)\n"
+                  << "  --no-subs     Skip subtitle download entirely\n"
+                  << "  --lang <L>    Subtitle language (default: English)\n";
         return 0;
     }
 
@@ -442,6 +471,8 @@ int main(int argc, char* argv[]) {
         std::string arg = argv[i];
         if (arg == "--no-subs") {
             g_noSubs = true;
+        } else if (arg == "--embed-subs") {
+            g_embedSubs = true;
         } else if (arg == "--lang" && i + 1 < argc) {
             g_subLang = argv[++i];
         }

@@ -8,3 +8,8 @@ imdbdownloader
 *.mp4
 *.mkv
 *.ts
+*.rar
+*.zip
+*.tar.gz
+*.7z
+*.srt
