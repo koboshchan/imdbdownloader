@@ -208,17 +208,25 @@ std::string findEpisodeSubtitle(const std::string& extractDir, int episode) {
     return best;
 }
 
-// Extract a subtitle archive (zip/rar) and return path to the episode's .srt
+// Extract a subtitle archive (zip/rar) and return path to the episode's .srt.
+// If the extraction directory already exists from a prior call (season-pack cache),
+// skip re-extraction and just search for the right episode file.
 std::string extractSubtitleArchive(const std::string& archivePath, const std::string& subId, int episode) {
     std::string extractDir = "/tmp/imdbsub_" + subId + "/";
-    std::system(("rm -rf \"" + extractDir + "\" && mkdir -p \"" + extractDir + "\"").c_str());
 
-    // unar flag: -D on macOS (The Unarchiver), -no-directory on some Linux builds; try both forms
-    std::string extractCmd = "unar -D -no-directory -force-overwrite \"" + archivePath + "\" -o \"" + extractDir + "\" >/dev/null 2>&1";
-    int rc = std::system(extractCmd.c_str());
-    if (rc != 0) {
-        // fallback to unzip for plain zip files
-        std::system(("unzip -o -j \"" + archivePath + "\" '*.srt' '*.sub' -d \"" + extractDir + "\" >/dev/null 2>&1").c_str());
+    // Reuse a previously extracted season pack if it's still present
+    std::string listCheck = "find \"" + extractDir + "\" -maxdepth 5 \\( -name '*.srt' -o -name '*.sub' \\) 2>/dev/null | head -1";
+    FILE* chk = popen(listCheck.c_str(), "r");
+    bool alreadyExtracted = false;
+    if (chk) {
+        char buf[4];
+        alreadyExtracted = (fgets(buf, sizeof(buf), chk) != nullptr);
+        pclose(chk);
+    }
+
+    if (!alreadyExtracted) {
+        std::system(("rm -rf \"" + extractDir + "\" && mkdir -p \"" + extractDir + "\"").c_str());
+        std::system(("unar -D -no-directory -force-overwrite \"" + archivePath + "\" -o \"" + extractDir + "\" >/dev/null 2>&1").c_str());
     }
 
     return findEpisodeSubtitle(extractDir, episode);
@@ -303,7 +311,29 @@ void downloadSubtitle(const std::string& title, int season, int episode, const s
     std::string safeName = subId + ".dl";
     std::string tmpPath  = "/tmp/imdbsub_" + safeName;
     std::string dlURL    = SUB_BASE + "?action=letolt&felirat=" + subId;
-    if (!downloadBinaryFile(dlURL, tmpPath)) { std::cerr << "[Subs] Download failed.\n"; return; }
+
+    // Only re-download if the cached file is missing or empty
+    bool needDownload = true;
+    {
+        FILE* f = fopen(tmpPath.c_str(), "rb");
+        if (f) {
+            fseek(f, 0, SEEK_END);
+            needDownload = (ftell(f) < 100);  // treat tiny/empty files as invalid
+            fclose(f);
+        }
+    }
+    if (needDownload && !downloadBinaryFile(dlURL, tmpPath)) { std::cerr << "[Subs] Download failed.\n"; return; }
+
+    // Verify the downloaded file is non-empty
+    {
+        FILE* f = fopen(tmpPath.c_str(), "rb");
+        if (f) {
+            fseek(f, 0, SEEK_END);
+            long sz = ftell(f);
+            fclose(f);
+            if (sz < 100) { std::cerr << "[Subs] Downloaded archive is empty or invalid.\n"; std::remove(tmpPath.c_str()); return; }
+        }
+    }
 
     // 4. Extract or move to final destination
     std::string ext = subFile.size() > 4 ? subFile.substr(subFile.size() - 4) : "";
@@ -325,7 +355,8 @@ void downloadSubtitle(const std::string& title, int season, int episode, const s
             std::remove(tmpPath.c_str());
             return;
         }
-        std::system(("rm -rf /tmp/imdbsub_" + subId + "/").c_str());
+        // Keep the extraction directory as a cache for subsequent episodes in the same season pack.
+        // Only wipe it on failure.
     } else {
         // Plain .srt / .sub — just move it
         std::string dest = outputBase + (ext.empty() ? ".srt" : ext);
@@ -656,6 +687,43 @@ int main(int argc, char* argv[]) {
         } else if (arg == "--lang" && i + 1 < argc) {
             g_subLang = argv[++i];
         }
+    }
+
+    // ── Dependency check ─────────────────────────────────────────────────────
+    {
+        // Detect platform for install hints
+        bool isMac = false;
+        {
+            FILE* p = popen("uname -s 2>/dev/null", "r");
+            if (p) {
+                char buf[16] = {};
+                if (fgets(buf, sizeof(buf), p)) isMac = (std::string(buf).find("Darwin") != std::string::npos);
+                pclose(p);
+            }
+        }
+
+        struct Tool { const char* cmd; const char* brew; const char* apt; };
+        const Tool tools[] = {
+            { "unar",   "unar",   "unar"   },
+            { "yt-dlp", "yt-dlp", "yt-dlp" },
+            { "ffmpeg", "ffmpeg", "ffmpeg"  },
+        };
+
+        bool missing = false;
+        for (auto& t : tools) {
+            std::string check = std::string("command -v ") + t.cmd + " >/dev/null 2>&1";
+            if (std::system(check.c_str()) != 0) {
+                if (!missing) {
+                    std::cerr << "Missing required dependencies:\n";
+                    missing = true;
+                }
+                if (isMac)
+                    std::cerr << "  " << t.cmd << "  →  brew install " << t.brew << "\n";
+                else
+                    std::cerr << "  " << t.cmd << "  →  sudo apt install " << t.apt << "\n";
+            }
+        }
+        if (missing) return 1;
     }
 
     std::cout << "Analyzing IMDB Media Signature..." << std::endl;
