@@ -4,43 +4,42 @@ Downloads movies and TV shows by IMDB ID using yt-dlp and ffmpeg. Subtitles are 
 
 ## Requirements
 
-- `yt-dlp` and `ffmpeg` in PATH
-- `unar` for TV show subtitle extraction
-- `libcurl` and `nlohmann/json` development headers
+- Node.js 18+
+- `yt-dlp`, `ffmpeg`, and `unar` in PATH
 
 ### macOS
 
 ```bash
-brew install curl nlohmann-json yt-dlp ffmpeg unar
+brew install yt-dlp ffmpeg unar
 ```
 
 ### Linux (Debian/Ubuntu)
 
 ```bash
-sudo apt install libcurl4-openssl-dev nlohmann-json3-dev unar ffmpeg
+sudo apt install unar ffmpeg
 pip install yt-dlp
 ```
 
-### Linux (Fedora/RHEL)
+## Setup
 
 ```bash
-sudo dnf install libcurl-devel json-devel unar ffmpeg
-pip install yt-dlp
+npm install
 ```
 
-## Build
+## Install to PATH
 
 ```bash
-make
-sudo make install
+sudo npm run install-bin
 ```
 
-The Makefile auto-detects Homebrew paths on macOS and uses `pkg-config` on Linux.
+This copies `downloader.js` to `/usr/local/bin/imdbdownloader` so you can run it from anywhere.
 
 ## Usage
 
 ```bash
 imdbdownloader <IMDB_ID> [options]
+# or without installing:
+node downloader.js <IMDB_ID> [options]
 ```
 
 **Options:**
@@ -68,9 +67,14 @@ Download a TV show (prompts for episode selection):
 imdbdownloader tt0480489
 ```
 
+Download with Spanish subtitles:
+```bash
+imdbdownloader tt0480489 --lang Spanish
+```
+
 ## Output
 
-- Movies are saved to `./<Title_Year>.mp4` in the current directory.
+- Movies are saved to `./<Title>.mp4` in the current directory.
 - TV shows are saved to `./<Title>/Season_N/<Title>-SN-EN.mp4`.
 - Subtitle files are saved alongside the video as `.srt` unless `--embed-subs` is used.
 
