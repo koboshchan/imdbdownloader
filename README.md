@@ -1,6 +1,6 @@
 # imdbdownloader
 
-Downloads movies and TV shows by IMDB ID using yt-dlp and ffmpeg. Subtitles are fetched automatically.
+Downloads movies and TV shows by IMDB ID using yt-dlp and ffmpeg. Subtitles are fetched automatically. Falls back to **AnimePahe** for anime titles when the primary stream source is unavailable.
 
 ## Requirements
 
@@ -50,6 +50,11 @@ node downloader.js <IMDB_ID> [options]
 | `--no-subs` | Skip subtitle download entirely |
 | `--lang <language>` | Subtitle language (default: English) |
 
+> **Note:** When running via `npm start`, pass flags after `--`:
+> ```bash
+> npm start -- tt0480489 --embed-subs
+> ```
+
 ## Examples
 
 Download a movie:
@@ -67,9 +72,14 @@ Download a TV show (prompts for episode selection):
 imdbdownloader tt0480489
 ```
 
-Download with Spanish subtitles:
+Download an anime (automatically uses AnimePahe if primary source fails):
 ```bash
-imdbdownloader tt0480489 --lang Spanish
+imdbdownloader tt13370404
+```
+
+Download with Japanese subtitles:
+```bash
+imdbdownloader tt13370404 --lang Japanese
 ```
 
 ## Output
@@ -77,6 +87,13 @@ imdbdownloader tt0480489 --lang Spanish
 - Movies are saved to `./<Title>.mp4` in the current directory.
 - TV shows are saved to `./<Title>/Season_N/<Title>-SN-EN.mp4`.
 - Subtitle files are saved alongside the video as `.srt` unless `--embed-subs` is used.
+
+## Stream Sources
+
+1. **Primary:** `streamdata.vaplayer.ru` — general movies and TV shows
+2. **Fallback:** [AnimePahe](https://animepahe.ru) — anime titles (auto-used when primary fails)
+
+Metadata (title, type) is always fetched from [imdbapi.dev](https://imdbapi.dev).
 
 ## Subtitle Sources
 

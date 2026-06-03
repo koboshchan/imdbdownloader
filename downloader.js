@@ -9,6 +9,7 @@ const os = require('os');
 const readline = require('readline');
 const zlib = require('zlib');
 const axios = require('axios');
+const cheerio = require('cheerio');
 const { program } = require('commander');
 
 // ── Global config ─────────────────────────────────────────────────────────────
@@ -19,7 +20,9 @@ const config = {
   subLang: 'English',
 };
 
-const SUB_BASE = 'https://feliratok.eu/index.php';
+const SUB_BASE      = 'https://feliratok.eu/index.php';
+const PAHE_BASE     = 'https://animepahe.ru';
+const IMDB_META_URL = 'https://api.imdbapi.dev/titles';
 
 // ── HTTP helpers ──────────────────────────────────────────────────────────────
 
@@ -99,6 +102,107 @@ async function downloadWyzie(url, filepath) {
     'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:153.0) Gecko/20100101 Firefox/153.0',
     'Referer': 'https://brightpathsignals.com/',
   });
+}
+
+// ── IMDB metadata (imdbapi.dev) ───────────────────────────────────────────────
+
+async function fetchImdbMetadata(imdbId) {
+  try {
+    const res = await axios.get(`${IMDB_META_URL}/${imdbId}`, { timeout: 15000 });
+    const d = res.data;
+    return {
+      title:         d.primaryTitle || d.originalTitle || imdbId,
+      originalTitle: d.originalTitle || d.primaryTitle || imdbId,
+      type:          d.type || 'movie',
+      genres:        d.genres || [],
+      startYear:     d.startYear || null,
+    };
+  } catch (e) {
+    console.error('[Meta] imdbapi.dev lookup failed:', e.message);
+    return { title: imdbId, originalTitle: imdbId, type: 'movie', genres: [], startYear: null };
+  }
+}
+
+function isShowType(type) {
+  return /series|mini|episode|special/i.test(type);
+}
+
+// ── AnimePahe stream fallback ─────────────────────────────────────────────────
+
+async function paheGet(url) {
+  const res = await axios.get(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+      'Referer':    PAHE_BASE + '/',
+    },
+    maxRedirects: 10,
+    timeout:      30000,
+    transformResponse: [data => data],
+  });
+  const text = res.data;
+  try { return JSON.parse(text); } catch { return text; }
+}
+
+async function paheSearch(query) {
+  const data = await paheGet(`${PAHE_BASE}/api?m=search&q=${encodeURIComponent(query)}`);
+  return Array.isArray(data?.data) ? data.data : [];
+}
+
+async function paheGetAllEpisodes(animeSession) {
+  let all = [];
+  let page = 1;
+  let lastPage = 1;
+  do {
+    const data = await paheGet(
+      `${PAHE_BASE}/api?m=release&id=${animeSession}&sort=episode_asc&page=${page}`
+    );
+    if (!data?.data) break;
+    all = all.concat(data.data);
+    lastPage = data.last_page || 1;
+    page++;
+  } while (page <= lastPage);
+  return all;
+}
+
+async function paheExtractLinks(animeSession, episodeSession) {
+  const html = await paheGet(`${PAHE_BASE}/play/${animeSession}/${episodeSession}`);
+  if (typeof html !== 'string') throw new Error('[Pahe] Expected HTML from play page');
+  const $ = cheerio.load(html);
+  const links = [];
+  $('div#resolutionMenu > button').each((_i, el) => {
+    const url     = $(el).attr('data-src');
+    const quality = $(el).text().trim();
+    if (url) links.push({ url, quality });
+  });
+  return links;
+}
+
+async function paheExtractM3U8(videoPageUrl) {
+  const html = await paheGet(videoPageUrl);
+  if (typeof html !== 'string') throw new Error('[Pahe] Expected HTML from video page');
+  const match = /(eval)(\(f.*?)(<\/script>)/s.exec(html);
+  if (!match) throw new Error('[Pahe] Packer script not found in video page');
+  // eslint-disable-next-line no-eval
+  const unpacked = eval(match[2].replace('eval', ''));
+  const m3u8 = unpacked.match(/https[^"' ]*\.m3u8[^"' ]*/);
+  if (!m3u8) throw new Error('[Pahe] M3U8 URL not found after unpacking');
+  return m3u8[0];
+}
+
+async function getStreamFromPahe(title, originalTitle, season) {
+  const queries = season > 1
+    ? [`${title} Season ${season}`, `${title} ${season}nd Season`, title, originalTitle]
+    : [title, originalTitle];
+
+  let results = [];
+  for (const q of [...new Set(queries)]) {
+    if (!q) continue;
+    console.log(`[Pahe] Searching: "${q}"...`);
+    results = await paheSearch(q);
+    if (results.length) break;
+  }
+  if (!results.length) throw new Error(`[Pahe] "${title}" not found on AnimePahe`);
+  return results;
 }
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
@@ -448,10 +552,13 @@ async function downloadSubtitleMovie(imdbId, outputBase) {
 
 // ── Video downloader ──────────────────────────────────────────────────────────
 
-function downloadStream(m3u8Url, outputPath) {
+function downloadStream(m3u8Url, outputPath, extraHeaders = {}) {
+  const userAgent = extraHeaders['User-Agent']
+    || 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:152.0) Gecko/20100101 Firefox/152.0';
+  const referer = extraHeaders['Referer'] || 'https://brightpathsignals.com/';
   const args = [
-    '--user-agent', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:152.0) Gecko/20100101 Firefox/152.0',
-    '--referer', 'https://brightpathsignals.com/',
+    '--user-agent', userAgent,
+    '--referer', referer,
     '--downloader', 'ffmpeg',
     m3u8Url,
     '-o', outputPath,
@@ -474,67 +581,146 @@ async function handleMovie(imdbId, title, streamUrls) {
   await downloadSubtitleMovie(imdbId, base);
 }
 
-async function handleShow(imdbId, title, epsData) {
-  console.log(`\nFound TV Show: ${title}`);
-  console.log('Available Seasons:');
-
-  const seasons = Object.keys(epsData);
-  for (const s of seasons) {
-    console.log(`  Season ${s} (${epsData[s].length} episodes)`);
-  }
-
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+async function handleShowWithPahe(imdbId, title, originalTitle, rl) {
+  console.log('\n[Pahe] Falling back to AnimePahe...');
   const ask = q => new Promise(res => rl.question(q, res));
 
-  console.log('\nOptions:\n  1. Download one specific episode\n  2. Download ALL episodes');
-  const modeStr = await ask('Choose an option (1-2): ');
-  const mode = parseInt(modeStr);
+  const seasonStr = await ask('Enter Season Number (default 1): ');
+  const season = parseInt(seasonStr) || 1;
+  const epStr   = await ask('Enter Episode Number (or "all"): ');
+
+  const results = await getStreamFromPahe(title, originalTitle, season);
+  console.log(`[Pahe] Using: "${results[0].title}"`);
+  const animeSession = results[0].session;
+
+  console.log('[Pahe] Fetching episode list...');
+  const episodes = await paheGetAllEpisodes(animeSession);
+  if (!episodes.length) {
+    rl.close();
+    console.error('[Pahe] No episodes found.');
+    return;
+  }
+  console.log(`[Pahe] ${episodes.length} episode(s) available.`);
+
   const cleanTitle = sanitizeFilename(title);
 
-  if (mode === 1) {
-    const chosenSeason = await ask('Enter Season Number: ');
-    const chosenEpStr  = await ask('Enter Episode Number: ');
+  if (epStr.trim().toLowerCase() === 'all') {
     rl.close();
-    const chosenEp = parseInt(chosenEpStr);
-
-    const epUrl = `https://streamdata.vaplayer.ru/api.php?imdb=${imdbId}&type=tv&season=${chosenSeason}&episode=${chosenEp}`;
-    const epRes = JSON.parse(stripToJSON(await fetchURL(epUrl)));
-    const urls = epRes?.data?.stream_urls || [];
-
-    if (urls.length) {
-      const base = `./${cleanTitle}-S${chosenSeason}-E${chosenEp}`;
-      downloadStream(urls[0], `${base}.mp4`);
-      await downloadSubtitle(title, parseInt(chosenSeason), chosenEp, base);
-    } else {
-      console.error('Failed to find streams for that episode.');
-    }
-
-  } else if (mode === 2) {
-    rl.close();
-    console.log('\nStarting bulk download queue...');
-    for (const seasonNum of seasons) {
-      const epCount = epsData[seasonNum].length;
-      for (let ep = 1; ep <= epCount; ep++) {
-        console.log(`\n--- Fetching S${seasonNum}E${ep} ---`);
-        const epUrl = `https://streamdata.vaplayer.ru/api.php?imdb=${imdbId}&type=tv&season=${seasonNum}&episode=${ep}`;
-        try {
-          const epRes = JSON.parse(stripToJSON(await fetchURL(epUrl)));
-          const urls = epRes?.data?.stream_urls || [];
-          if (urls.length) {
-            const dir = `./${cleanTitle}/Season_${seasonNum}`;
-            fs.mkdirSync(dir, { recursive: true });
-            const base = `${dir}/${cleanTitle}-S${seasonNum}-E${ep}`;
-            downloadStream(urls[0], `${base}.mp4`);
-            await downloadSubtitle(title, parseInt(seasonNum), ep, base);
-          }
-        } catch {
-          console.error(`Skipping S${seasonNum}E${ep} due to API parsing error.`);
-        }
+    for (const ep of episodes) {
+      const epNum = ep.episode;
+      console.log(`\n--- S${season}E${epNum} ---`);
+      try {
+        const links = await paheExtractLinks(animeSession, ep.session);
+        if (!links.length) { console.error(`[Pahe] No links for episode ${epNum}`); continue; }
+        const best = links.find(l => l.quality.includes('1080'))
+                  || links.find(l => l.quality.includes('720'))
+                  || links[0];
+        const m3u8 = await paheExtractM3U8(best.url);
+        const dir  = `./${cleanTitle}/Season_${season}`;
+        fs.mkdirSync(dir, { recursive: true });
+        const base = `${dir}/${cleanTitle}-S${season}-E${epNum}`;
+        downloadStream(m3u8, `${base}.mp4`, { Referer: 'https://kwik.si/' });
+        await downloadSubtitle(title, season, epNum, base);
+      } catch (err) {
+        console.error(`[Pahe] Skipping S${season}E${epNum}: ${err.message}`);
       }
     }
   } else {
+    const epNum = parseInt(epStr);
     rl.close();
-    console.error('Invalid option.');
+    const ep = episodes.find(e => e.episode === epNum);
+    if (!ep) { console.error(`[Pahe] Episode ${epNum} not found.`); return; }
+    const links = await paheExtractLinks(animeSession, ep.session);
+    if (!links.length) { console.error('[Pahe] No download links found.'); return; }
+    const best = links.find(l => l.quality.includes('1080'))
+              || links.find(l => l.quality.includes('720'))
+              || links[0];
+    console.log(`[Pahe] Extracting M3U8 (quality: ${best.quality})...`);
+    const m3u8 = await paheExtractM3U8(best.url);
+    const base = `./${cleanTitle}-S${season}-E${epNum}`;
+    downloadStream(m3u8, `${base}.mp4`, { Referer: 'https://kwik.si/' });
+    await downloadSubtitle(title, season, epNum, base);
+  }
+}
+
+async function handleShow(imdbId, title, originalTitle, epsData) {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const ask = q => new Promise(res => rl.question(q, res));
+
+  // vaplayer path: epsData is a valid { '1': [...], '2': [...] } object
+  if (epsData && typeof epsData === 'object' && Object.keys(epsData).length) {
+    console.log(`\nFound TV Show: ${title}`);
+    console.log('Available Seasons:');
+    const seasons = Object.keys(epsData);
+    for (const s of seasons) {
+      const count = Array.isArray(epsData[s]) ? epsData[s].length : epsData[s];
+      console.log(`  Season ${s} (${count} episodes)`);
+    }
+
+    console.log('\nOptions:\n  1. Download one specific episode\n  2. Download ALL episodes');
+    const modeStr = await ask('Choose an option (1-2): ');
+    const mode = parseInt(modeStr);
+    const cleanTitle = sanitizeFilename(title);
+
+    if (mode === 1) {
+      const chosenSeason = await ask('Enter Season Number: ');
+      const chosenEpStr  = await ask('Enter Episode Number: ');
+      rl.close();
+      const chosenEp = parseInt(chosenEpStr);
+
+      const epUrl = `https://streamdata.vaplayer.ru/api.php?imdb=${imdbId}&type=tv&season=${chosenSeason}&episode=${chosenEp}`;
+      try {
+        const epRes = JSON.parse(stripToJSON(await fetchURL(epUrl)));
+        const urls = epRes?.data?.stream_urls || [];
+        if (urls.length) {
+          const base = `./${cleanTitle}-S${chosenSeason}-E${chosenEp}`;
+          downloadStream(urls[0], `${base}.mp4`);
+          await downloadSubtitle(title, parseInt(chosenSeason), chosenEp, base);
+        } else {
+          console.error('No stream found via primary source.');
+        }
+      } catch {
+        console.error('Primary source failed for that episode.');
+      }
+    } else if (mode === 2) {
+      rl.close();
+      console.log('\nStarting bulk download queue...');
+      for (const seasonNum of seasons) {
+        const epList = epsData[seasonNum];
+        const epCount = Array.isArray(epList) ? epList.length : parseInt(epList) || 0;
+        for (let ep = 1; ep <= epCount; ep++) {
+          console.log(`\n--- Fetching S${seasonNum}E${ep} ---`);
+          const epUrl = `https://streamdata.vaplayer.ru/api.php?imdb=${imdbId}&type=tv&season=${seasonNum}&episode=${ep}`;
+          try {
+            const epRes = JSON.parse(stripToJSON(await fetchURL(epUrl)));
+            const urls = epRes?.data?.stream_urls || [];
+            if (urls.length) {
+              const dir  = `./${cleanTitle}/Season_${seasonNum}`;
+              fs.mkdirSync(dir, { recursive: true });
+              const base = `${dir}/${cleanTitle}-S${seasonNum}-E${ep}`;
+              downloadStream(urls[0], `${base}.mp4`);
+              await downloadSubtitle(title, parseInt(seasonNum), ep, base);
+            }
+          } catch {
+            console.error(`Skipping S${seasonNum}E${ep} due to error.`);
+          }
+        }
+      }
+    } else {
+      rl.close();
+      console.error('Invalid option.');
+    }
+    return;
+  }
+
+  // Fallback to AnimePahe
+  console.log(`\nFound TV Show: ${title}`);
+  console.log('[Info] Primary stream source unavailable — using AnimePahe.');
+  try {
+    await handleShowWithPahe(imdbId, title, originalTitle, rl);
+  } catch (err) {
+    rl.close();
+    console.error('[Pahe] Download failed:', err.message);
   }
 }
 
@@ -574,9 +760,12 @@ async function main() {
     .addHelpText('after', `
 Examples:
   $ imdbdownloader tt0480489
-  $ imdbdownloader tt0480489 --embed-subs
-  $ imdbdownloader tt0480489 --lang English
-  $ imdbdownloader tt0480489 --no-subs`)
+  $ node downloader.js tt0480489 --embed-subs
+  $ node downloader.js tt0480489 --lang Japanese
+  $ node downloader.js tt0480489 --no-subs
+
+Note: when using "npm start", pass flags after "--":
+  $ npm start -- tt0480489 --embed-subs`)
     .parse();
 
   const [imdbId] = program.args;
@@ -590,23 +779,45 @@ Examples:
   if (!checkDependencies()) process.exit(1);
 
   console.log('Analyzing IMDB Media Signature...');
-  const initialUrl = `https://streamdata.vaplayer.ru/api.php?imdb=${imdbId}&type=tv`;
-  const rawJson = await fetchURL(initialUrl);
 
-  if (!rawJson) {
-    console.error('Failed to retrieve data from api endpoint.');
-    process.exit(1);
+  // 1. Fetch reliable metadata from imdbapi.dev
+  const meta = await fetchImdbMetadata(imdbId);
+  console.log(`\nTitle: ${meta.title} (${meta.type})`);
+
+  // 2. Attempt primary stream source (vaplayer)
+  let vaplayerData = null;
+  try {
+    const rawJson = await fetchURL(
+      `https://streamdata.vaplayer.ru/api.php?imdb=${imdbId}&type=tv`
+    );
+    if (rawJson) {
+      const res = JSON.parse(stripToJSON(rawJson));
+      // vaplayer returns eps:false for movies, or an object of seasons for shows
+      if (res?.data) vaplayerData = res.data;
+    }
+  } catch {
+    // vaplayer unavailable — will fall back below
   }
 
-  const res = JSON.parse(stripToJSON(rawJson));
-  const title = res?.data?.title;
-
-  if (res?.data?.eps === false) {
-    const movieUrl = `https://streamdata.vaplayer.ru/api.php?imdb=${imdbId}&type=movie`;
-    const movieRes = JSON.parse(stripToJSON(await fetchURL(movieUrl)));
-    await handleMovie(imdbId, title, movieRes?.data?.stream_urls);
+  if (!isShowType(meta.type)) {
+    // Movie path
+    let streamUrls = vaplayerData?.stream_urls || [];
+    if (!streamUrls.length && vaplayerData?.eps === false) {
+      // Try explicit movie endpoint
+      try {
+        const movieRaw = await fetchURL(
+          `https://streamdata.vaplayer.ru/api.php?imdb=${imdbId}&type=movie`
+        );
+        if (movieRaw) {
+          const movieRes = JSON.parse(stripToJSON(movieRaw));
+          streamUrls = movieRes?.data?.stream_urls || [];
+        }
+      } catch {}
+    }
+    await handleMovie(imdbId, meta.title, streamUrls);
   } else {
-    await handleShow(imdbId, title, res?.data?.eps);
+    // TV Show path — pass eps from vaplayer (may be null → triggers pahe fallback)
+    await handleShow(imdbId, meta.title, meta.originalTitle, vaplayerData?.eps ?? null);
   }
 }
 
