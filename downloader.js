@@ -47,11 +47,12 @@ class DownloadManager {
       ...task,
       downloaded: false,
       claimed: null,
+      failed: false,
     });
   }
 
   claimTask(workerId) {
-    const task = this.tasks.find(t => !t.claimed && !t.downloaded);
+    const task = this.tasks.find(t => !t.claimed && !t.downloaded && !t.failed);
     if (task) {
       task.claimed = workerId;
       return task;
@@ -71,9 +72,14 @@ class DownloadManager {
     if (!this.isBulk) return;
 
     const completed = this.tasks.filter(t => t.downloaded).length;
+    const failed = this.tasks.filter(t => t.failed).length;
     const total = this.tasks.length;
-    const percent = total > 0 ? Math.floor((completed / total) * 100) : 0;
-    const bar = '[' + '#'.repeat(completed) + '-'.repeat(total - completed) + ']';
+    const processed = completed + failed;
+    const percent = total > 0 ? Math.floor((processed / total) * 100) : 0;
+    
+    const barWidth = Math.floor((process.stdout.columns || 80) * 0.9);
+    const filledWidth = total > 0 ? Math.floor((processed / total) * barWidth) : 0;
+    const bar = '[' + '#'.repeat(filledWidth) + '-'.repeat(barWidth - filledWidth) + ']';
 
     // Move cursor up to overwrite previous lines (2 for total progress + 2 per thread)
     const lines = (this.workerStatus.length * 2) + 2;
@@ -81,7 +87,8 @@ class DownloadManager {
     readline.moveCursor(process.stdout, 0, -lines);
 
     // Render Total Progress
-    process.stdout.write(`\x1b[KTotal Progress: ${bar} ${percent}% (${completed}/${total} episodes)\n\x1b[K\n`);
+    const failedText = failed > 0 ? `, ${failed} failed` : '';
+    process.stdout.write(`\x1b[KTotal Progress: ${bar} ${percent}% (${processed}/${total} episodes${failedText})\n\x1b[K\n`);
 
     for (const w of this.workerStatus) {
       const taskLabel = w.currentTask ? `S${w.currentTask.season}E${w.currentTask.episode}` : 'None';
@@ -741,6 +748,7 @@ async function downloadWorker(workerId, manager, title, streamSourceFn) {
       task.downloaded = true;
       manager.updateWorker(workerId, { status: 'Done', progress: 100 });
     } catch (err) {
+      task.failed = true;
       manager.updateWorker(workerId, { status: `Error: ${err.message.slice(0, 15)}`, progress: 0 });
     }
   }
