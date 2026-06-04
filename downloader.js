@@ -37,6 +37,7 @@ class DownloadManager {
       status: 'Idle',
       progress: 0,
       currentTask: null,
+      lastOutput: '',
     }));
     this.isBulk = false;
   }
@@ -70,21 +71,23 @@ class DownloadManager {
     if (!this.isBulk) return;
 
     // Move cursor up to overwrite previous lines
-    const lines = this.workerStatus.length;
+    const lines = this.workerStatus.length * 2;
     readline.cursorTo(process.stdout, 0);
     readline.moveCursor(process.stdout, 0, -lines);
 
     for (const w of this.workerStatus) {
       const taskLabel = w.currentTask ? `S${w.currentTask.season}E${w.currentTask.episode}` : 'None';
       
-      process.stdout.write(`\r\x1b[KThread ${w.id}: ${taskLabel.padEnd(8)} | [${w.status}]\n`);
+      process.stdout.write(`\x1b[KThread ${w.id}: ${taskLabel.padEnd(8)} | [${w.status}]\n`);
+      const out = w.lastOutput || '';
+      process.stdout.write(`\x1b[K  ${out.slice(0, (process.stdout.columns || 80) - 4)}\n`);
     }
   }
 
   startBulk() {
     this.isBulk = true;
     // Prepare space for progress bars
-    for (let i = 0; i < this.threads; i++) process.stdout.write('\n');
+    for (let i = 0; i < this.threads * 2; i++) process.stdout.write('\n');
     this.render();
   }
 }
@@ -615,7 +618,7 @@ async function downloadSubtitleMovie(imdbId, outputBase) {
 
 // ── Video downloader ──────────────────────────────────────────────────────────
 
-async function downloadStream(m3u8Url, outputPath, extraHeaders = {}, onProgress = null, fragments = 8) {
+async function downloadStream(m3u8Url, outputPath, extraHeaders = {}, onProgress = null, fragments = 8, onOutput = null) {
   const userAgent = extraHeaders['User-Agent']
     || 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:152.0) Gecko/20100101 Firefox/152.0';
   const referer = extraHeaders['Referer'] || 'https://brightpathsignals.com/';
@@ -630,13 +633,27 @@ async function downloadStream(m3u8Url, outputPath, extraHeaders = {}, onProgress
 
   return new Promise((resolve, reject) => {
     const child = spawn('yt-dlp', args);
+    let linesInitialized = false;
 
     child.stdout.on('data', (data) => {
-      const line = data.toString();
-      process.stdout.write(line);
+      const text = data.toString();
+      const lines = text.split('\n').filter(l => l.trim());
+      if (lines.length === 0) return;
+      const lastLine = lines[lines.length - 1];
+
+      if (onOutput) {
+        onOutput(lastLine);
+      } else {
+        if (!linesInitialized) {
+          process.stdout.write('\n');
+          linesInitialized = true;
+        }
+        readline.moveCursor(process.stdout, 0, -1);
+        process.stdout.write(`\r\x1b[KStatus: Downloading...\n\x1b[K${lastLine.slice(0, (process.stdout.columns || 80) - 1)}`);
+      }
+
       if (onProgress) {
-        // [download]  10.0% of ~20.00MiB at  2.00MiB/s ETA 00:10
-        const match = /\[download\]\s+(\d+\.\d+)%/.exec(line);
+        const match = /\[download\]\s+(\d+\.\d+)%/.exec(lastLine);
         if (match) {
           onProgress(parseFloat(match[1]));
         }
@@ -644,6 +661,7 @@ async function downloadStream(m3u8Url, outputPath, extraHeaders = {}, onProgress
     });
 
     child.on('close', (code) => {
+      if (!onOutput && linesInitialized) process.stdout.write('\n');
       if (code === 0) resolve();
       else reject(new Error(`yt-dlp failed with code ${code}`));
     });
@@ -673,7 +691,9 @@ async function downloadWorker(workerId, manager, title, streamSourceFn) {
 
       await downloadStream(m3u8, outputPath, extraHeaders || {}, (p) => {
         manager.updateWorker(workerId, { progress: p });
-      }, config.fragments);
+      }, config.fragments, (line) => {
+        manager.updateWorker(workerId, { lastOutput: line });
+      });
 
       manager.updateWorker(workerId, { status: 'Muxing', progress: 100 });
       await downloadSubtitle(title, parseInt(season), episode, fileNameBase, true);
