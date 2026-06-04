@@ -77,7 +77,7 @@ class DownloadManager {
     const processed = completed + failed;
     const percent = total > 0 ? Math.floor((processed / total) * 100) : 0;
     
-    const barWidth = Math.floor((process.stdout.columns || 80) * 0.9);
+    const barWidth = Math.floor((process.stdout.columns || 80) * 0.85);
     const filledWidth = total > 0 ? Math.floor((processed / total) * barWidth) : 0;
     const bar = '[' + '#'.repeat(filledWidth) + '-'.repeat(barWidth - filledWidth) + ']';
 
