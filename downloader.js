@@ -409,25 +409,55 @@ function extractSubtitleArchive(archivePath, subId, episode) {
 
 // ── Subtitle mux helper ───────────────────────────────────────────────────────
 
-async function muxSubtitleIntoVideo(outputBase) {
+async function muxSubtitleIntoVideo(outputBase, onOutput = null) {
   if (!config.embedSubs) return;
   const videoPath = `${outputBase}.mp4`;
   const srtPath   = `${outputBase}.srt`;
   const tmpMux    = `${outputBase}_mux.mp4`;
-  const muxCmd    = `ffmpeg -y -i "${videoPath}" -i "${srtPath}" -c:v copy -c:a copy -c:s mov_text ` +
-                    `-metadata:s:s:0 language=${config.subLang} "${tmpMux}"`;
+
+  const args = [
+    '-y', '-i', videoPath, '-i', srtPath,
+    '-c:v', 'copy', '-c:a', 'copy', '-c:s', 'mov_text',
+    '-metadata:s:s:0', `language=${config.subLang}`,
+    tmpMux
+  ];
   
   return new Promise((resolve) => {
-    exec(muxCmd, (error) => {
-      if (error) {
+    const child = spawn('ffmpeg', args);
+    let linesInitialized = false;
+
+    const handleData = (data) => {
+      const text = data.toString();
+      const lines = text.split('\n').filter(l => l.trim());
+      if (lines.length === 0) return;
+      const lastLine = lines[lines.length - 1];
+
+      if (onOutput) {
+        onOutput(lastLine);
+      } else {
+        if (!linesInitialized) {
+          process.stdout.write('\n');
+          linesInitialized = true;
+        }
+        readline.moveCursor(process.stdout, 0, -1);
+        process.stdout.write(`\r\x1b[KStatus: Muxing Subtitles...\n\x1b[K${lastLine.slice(0, (process.stdout.columns || 80) - 1)}`);
+      }
+    };
+
+    child.stdout.on('data', handleData);
+    child.stderr.on('data', handleData);
+
+    child.on('close', (code) => {
+      if (!onOutput && linesInitialized) process.stdout.write('\n');
+      if (code !== 0) {
         console.error('[Subs] ffmpeg mux failed; keeping standalone .srt');
-        resolve(); // resolve anyway to continue
+        resolve();
         return;
       }
       try {
-        fs.unlinkSync(videoPath);
+        if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
         fs.renameSync(tmpMux, videoPath);
-        try { fs.unlinkSync(srtPath); } catch {}
+        if (fs.existsSync(srtPath)) fs.unlinkSync(srtPath);
       } catch {}
       resolve();
     });
@@ -436,7 +466,7 @@ async function muxSubtitleIntoVideo(outputBase) {
 
 // ── TV subtitle downloader (feliratok.eu) ─────────────────────────────────────
 
-async function downloadSubtitle(title, season, episode, outputBase, silent = false) {
+async function downloadSubtitle(title, season, episode, outputBase, silent = false, onOutput = null) {
   if (config.noSubs) return;
 
   const hunLang = engToHun(config.subLang);
@@ -525,12 +555,12 @@ async function downloadSubtitle(title, season, episode, outputBase, silent = fal
     try { fs.unlinkSync(tmpPath); } catch {}
   }
 
-  await muxSubtitleIntoVideo(outputBase);
+  await muxSubtitleIntoVideo(outputBase, onOutput);
 }
 
 // ── Movie subtitle downloader (OpenSubtitles + wyzie.io) ─────────────────────
 
-async function downloadSubtitleMovie(imdbId, outputBase) {
+async function downloadSubtitleMovie(imdbId, outputBase, onOutput = null) {
   if (config.noSubs) return;
 
   let imdbNum = imdbId.startsWith('tt') ? imdbId.slice(2) : imdbId;
@@ -613,7 +643,7 @@ async function downloadSubtitleMovie(imdbId, outputBase) {
     try { fs.unlinkSync(tmpSrt); } catch {}
   }
 
-  await muxSubtitleIntoVideo(outputBase);
+  await muxSubtitleIntoVideo(outputBase, onOutput);
 }
 
 // ── Video downloader ──────────────────────────────────────────────────────────
@@ -696,7 +726,9 @@ async function downloadWorker(workerId, manager, title, streamSourceFn) {
       });
 
       manager.updateWorker(workerId, { status: 'Muxing', progress: 100 });
-      await downloadSubtitle(title, parseInt(season), episode, fileNameBase, true);
+      await downloadSubtitle(title, parseInt(season), episode, fileNameBase, true, (line) => {
+        manager.updateWorker(workerId, { lastOutput: line });
+      });
 
       task.downloaded = true;
       manager.updateWorker(workerId, { status: 'Done', progress: 100 });
