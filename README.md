@@ -99,3 +99,23 @@ Metadata (title, type) is always fetched from [imdbapi.dev](https://imdbapi.dev)
 
 - Movies: OpenSubtitles REST API
 - TV shows: feliratok.eu
+
+## Unmask
+
+When downloading videos from sites, using yt-dlp/ffmpeg, the file might be masked under a png file. Like this:
+
+```
+00000000: 8950 4e47 0d0a 1a0a 0000 000d 4948 4452  .PNG........IHDR
+00000010: 0000 0001 0000 0001 0806 0000 001f 15c4  ................
+00000020: 8900 0000 0173 5247 4200 aece 1ce9 0000  .....sRGB.......
+```
+
+To unmask it, you can use the unmask.py script:
+
+```bash
+python unmask.py -i <masked_file.png> -o <output_file.mp4>
+```
+
+## License
+
+MIT License
