@@ -2,7 +2,7 @@
 
 'use strict';
 
-const { execSync, spawnSync } = require('child_process');
+const { execSync, spawnSync, spawn, exec } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -18,11 +18,75 @@ const config = {
   noSubs: false,
   embedSubs: false,
   subLang: 'English',
+  threads: 3,
 };
 
 const SUB_BASE      = 'https://feliratok.eu/index.php';
 const PAHE_BASE     = 'https://animepahe.ru';
 const IMDB_META_URL = 'https://api.imdbapi.dev/titles';
+
+// ── Download Management & UI ──────────────────────────────────────────────────
+
+class DownloadManager {
+  constructor(threads) {
+    this.tasks = [];
+    this.threads = threads;
+    this.workerStatus = Array.from({ length: threads }, (_, i) => ({
+      id: i + 1,
+      status: 'Idle',
+      progress: 0,
+      currentTask: null,
+    }));
+    this.isBulk = false;
+  }
+
+  addTask(task) {
+    this.tasks.push({
+      ...task,
+      downloaded: false,
+      claimed: null,
+    });
+  }
+
+  claimTask(workerId) {
+    const task = this.tasks.find(t => !t.claimed && !t.downloaded);
+    if (task) {
+      task.claimed = workerId;
+      return task;
+    }
+    return null;
+  }
+
+  updateWorker(workerId, update) {
+    const worker = this.workerStatus.find(w => w.id === workerId);
+    if (worker) {
+      Object.assign(worker, update);
+      this.render();
+    }
+  }
+
+  render() {
+    if (!this.isBulk) return;
+
+    // Move cursor up to overwrite previous lines
+    const lines = this.workerStatus.length;
+    readline.cursorTo(process.stdout, 0);
+    readline.moveCursor(process.stdout, 0, -lines);
+
+    for (const w of this.workerStatus) {
+      const taskLabel = w.currentTask ? `S${w.currentTask.season}E${w.currentTask.episode}` : 'None';
+      
+      process.stdout.write(`\r\x1b[KThread ${w.id}: ${taskLabel.padEnd(8)} | [${w.status}]\n`);
+    }
+  }
+
+  startBulk() {
+    this.isBulk = true;
+    // Prepare space for progress bars
+    for (let i = 0; i < this.threads; i++) process.stdout.write('\n');
+    this.render();
+  }
+}
 
 // ── HTTP helpers ──────────────────────────────────────────────────────────────
 
@@ -341,43 +405,48 @@ function extractSubtitleArchive(archivePath, subId, episode) {
 
 // ── Subtitle mux helper ───────────────────────────────────────────────────────
 
-function muxSubtitleIntoVideo(outputBase) {
+async function muxSubtitleIntoVideo(outputBase) {
   if (!config.embedSubs) return;
   const videoPath = `${outputBase}.mp4`;
   const srtPath   = `${outputBase}.srt`;
   const tmpMux    = `${outputBase}_mux.mp4`;
   const muxCmd    = `ffmpeg -y -i "${videoPath}" -i "${srtPath}" -c:v copy -c:a copy -c:s mov_text ` +
                     `-metadata:s:s:0 language=${config.subLang} "${tmpMux}"`;
-  console.log('[Subs] Muxing subtitle into video...');
-  try {
-    execSync(muxCmd, { stdio: 'inherit' });
-    fs.unlinkSync(videoPath);
-    fs.renameSync(tmpMux, videoPath);
-    try { fs.unlinkSync(srtPath); } catch {}
-    console.log(`[Subs] Embedded into: ${videoPath}`);
-  } catch {
-    console.error('[Subs] ffmpeg mux failed; keeping standalone .srt');
-    try { fs.unlinkSync(tmpMux); } catch {}
-  }
+  
+  return new Promise((resolve) => {
+    exec(muxCmd, (error) => {
+      if (error) {
+        console.error('[Subs] ffmpeg mux failed; keeping standalone .srt');
+        resolve(); // resolve anyway to continue
+        return;
+      }
+      try {
+        fs.unlinkSync(videoPath);
+        fs.renameSync(tmpMux, videoPath);
+        try { fs.unlinkSync(srtPath); } catch {}
+      } catch {}
+      resolve();
+    });
+  });
 }
 
 // ── TV subtitle downloader (feliratok.eu) ─────────────────────────────────────
 
-async function downloadSubtitle(title, season, episode, outputBase) {
+async function downloadSubtitle(title, season, episode, outputBase, silent = false) {
   if (config.noSubs) return;
 
   const hunLang = engToHun(config.subLang);
-  console.log(`\n[Subs] Searching for ${config.subLang} subtitles on feliratok.eu...`);
+  if (!silent) console.log(`\n[Subs] Searching for ${config.subLang} subtitles on feliratok.eu...`);
 
   // 1. Resolve show ID via autoname
   const lookupTitle = stripYear(title);
   const autoResp = await fetchSubAPI(`action=autoname&nyelv=0&term=${encodeURIComponent(lookupTitle)}`);
-  if (!autoResp) { console.error('[Subs] autoname request failed.'); return; }
+  if (!autoResp) { if (!silent) console.error('[Subs] autoname request failed.'); return; }
 
   let autoData;
-  try { autoData = JSON.parse(autoResp); } catch { console.error('[Subs] Failed to parse autoname response.'); return; }
-  if (!Array.isArray(autoData) || !autoData.length) { console.error(`[Subs] No show ID found for "${title}".`); return; }
-  if (autoData[0]?.ID === '-100x') { console.error('[Subs] Show not found on feliratok.eu.'); return; }
+  try { autoData = JSON.parse(autoResp); } catch { if (!silent) console.error('[Subs] Failed to parse autoname response.'); return; }
+  if (!Array.isArray(autoData) || !autoData.length) { if (!silent) console.error(`[Subs] No show ID found for "${title}".`); return; }
+  if (autoData[0]?.ID === '-100x') { if (!silent) console.error('[Subs] Show not found on feliratok.eu.'); return; }
 
   // Pick highest numeric ID (most recently added entry)
   let showId = autoData[0].ID;
@@ -385,7 +454,7 @@ async function downloadSubtitle(title, season, episode, outputBase) {
     const id = entry.ID || '0';
     if (id !== '-100x' && parseInt(id) > parseInt(showId)) showId = id;
   }
-  console.log(`[Subs] Show ID: ${showId}`);
+  if (!silent) console.log(`[Subs] Show ID: ${showId}`);
 
   // 2. Search for subtitles via HTML
   let searchParams = `action=search&sid=${showId}`;
@@ -398,7 +467,7 @@ async function downloadSubtitle(title, season, episode, outputBase) {
 
   // Fallback: retry without language filter
   if (!results.length && hunLang) {
-    console.log(`[Subs] No ${config.subLang} subtitle found; retrying without language filter...`);
+    if (!silent) console.log(`[Subs] No ${config.subLang} subtitle found; retrying without language filter...`);
     let fallbackParams = `action=search&sid=${showId}`;
     if (season  > 0) fallbackParams += `&ev=${season}`;
     if (episode > 0) fallbackParams += `&epizod=${episode}`;
@@ -406,26 +475,23 @@ async function downloadSubtitle(title, season, episode, outputBase) {
     results = parseSubtitleHTML(html);
   }
 
-  if (!results.length) { console.error('[Subs] No subtitles found.'); return; }
+  if (!results.length) { if (!silent) console.error('[Subs] No subtitles found.'); return; }
 
   const { subId, filename: subFile } = results[0];
-  console.log(`[Subs] Found: ${subFile} (ID ${subId})`);
 
   // 3. Download subtitle archive
-  const tmpPath = `/tmp/imdbsub_${subId}.dl`;
+  const tmpPath = `/tmp/imdbsub_${subId}_S${season}E${episode}.dl`;
   const dlURL   = `${SUB_BASE}?action=letolt&felirat=${subId}`;
 
   let needDownload = true;
   try { needDownload = fs.statSync(tmpPath).size < 100; } catch {}
 
   if (needDownload && !await downloadBinaryFile(dlURL, tmpPath)) {
-    console.error('[Subs] Download failed.');
     return;
   }
 
   try {
     if (fs.statSync(tmpPath).size < 100) {
-      console.error('[Subs] Downloaded archive is empty or invalid.');
       try { fs.unlinkSync(tmpPath); } catch {}
       return;
     }
@@ -442,9 +508,7 @@ async function downloadSubtitle(title, season, episode, outputBase) {
         execSync(`cp "${extracted}" "${dest}"`);
         try { fs.unlinkSync(extracted); } catch {}
       }
-      console.log(`[Subs] Saved: ${dest}`);
     } else {
-      console.error('[Subs] No .srt/.sub found inside archive.');
       try { execSync(`rm -rf /tmp/imdbsub_${subId}/`); } catch {}
       try { fs.unlinkSync(tmpPath); } catch {}
       return;
@@ -454,11 +518,10 @@ async function downloadSubtitle(title, season, episode, outputBase) {
     try { fs.renameSync(tmpPath, dest); } catch {
       execSync(`cp "${tmpPath}" "${dest}"`);
     }
-    console.log(`[Subs] Saved: ${dest}`);
     try { fs.unlinkSync(tmpPath); } catch {}
   }
 
-  muxSubtitleIntoVideo(outputBase);
+  await muxSubtitleIntoVideo(outputBase);
 }
 
 // ── Movie subtitle downloader (OpenSubtitles + wyzie.io) ─────────────────────
@@ -545,14 +608,13 @@ async function downloadSubtitleMovie(imdbId, outputBase) {
     execSync(`cp "${tmpSrt}" "${dest}"`);
     try { fs.unlinkSync(tmpSrt); } catch {}
   }
-  console.log(`[Subs] Saved: ${dest}`);
 
-  muxSubtitleIntoVideo(outputBase);
+  await muxSubtitleIntoVideo(outputBase);
 }
 
 // ── Video downloader ──────────────────────────────────────────────────────────
 
-function downloadStream(m3u8Url, outputPath, extraHeaders = {}) {
+async function downloadStream(m3u8Url, outputPath, extraHeaders = {}, onProgress = null) {
   const userAgent = extraHeaders['User-Agent']
     || 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:152.0) Gecko/20100101 Firefox/152.0';
   const referer = extraHeaders['Referer'] || 'https://brightpathsignals.com/';
@@ -560,11 +622,67 @@ function downloadStream(m3u8Url, outputPath, extraHeaders = {}) {
     '--user-agent', userAgent,
     '--referer', referer,
     '--downloader', 'ffmpeg',
+    '--newline',
     m3u8Url,
     '-o', outputPath,
   ];
-  console.log('\nExecuting: yt-dlp', args.join(' '));
-  spawnSync('yt-dlp', args, { stdio: 'inherit' });
+
+  return new Promise((resolve, reject) => {
+    const child = spawn('yt-dlp', args);
+
+    child.stdout.on('data', (data) => {
+      const line = data.toString();
+      if (onProgress) {
+        // [download]  10.0% of ~20.00MiB at  2.00MiB/s ETA 00:10
+        const match = /\[download\]\s+(\d+\.\d+)%/.exec(line);
+        if (match) {
+          onProgress(parseFloat(match[1]));
+        }
+      }
+    });
+
+    child.on('close', (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`yt-dlp failed with code ${code}`));
+    });
+  });
+}
+
+// ── Content handlers ──────────────────────────────────────────────────────────
+
+async function downloadWorker(workerId, manager, title, streamSourceFn) {
+  while (true) {
+    const task = manager.claimTask(workerId);
+    if (!task) break;
+
+    manager.updateWorker(workerId, {
+      status: 'Downloading',
+      progress: 0,
+      currentTask: task,
+    });
+
+    try {
+      const { season, episode, baseDir, fileNameBase, extraHeaders } = task;
+      const m3u8 = await streamSourceFn(task);
+      if (!m3u8) throw new Error('No stream URL');
+
+      fs.mkdirSync(baseDir, { recursive: true });
+      const outputPath = `${fileNameBase}.mp4`;
+
+      await downloadStream(m3u8, outputPath, extraHeaders || {}, (p) => {
+        manager.updateWorker(workerId, { progress: p });
+      });
+
+      manager.updateWorker(workerId, { status: 'Muxing', progress: 100 });
+      await downloadSubtitle(title, parseInt(season), episode, fileNameBase, true);
+
+      task.downloaded = true;
+      manager.updateWorker(workerId, { status: 'Done', progress: 100 });
+    } catch (err) {
+      manager.updateWorker(workerId, { status: `Error: ${err.message.slice(0, 15)}`, progress: 0 });
+    }
+  }
+  manager.updateWorker(workerId, { status: 'Finished', currentTask: null });
 }
 
 // ── Content handlers ──────────────────────────────────────────────────────────
@@ -577,7 +695,11 @@ async function handleMovie(imdbId, title, streamUrls) {
   const base = `./${sanitizeFilename(title)}`;
   console.log(`\nFound Movie: ${title}`);
   console.log(`Downloading to ${base}.mp4...`);
-  downloadStream(streamUrls[0], `${base}.mp4`);
+  
+  await downloadStream(streamUrls[0], `${base}.mp4`, {}, (p) => {
+    process.stdout.write(`\rStatus: Downloading... `);
+  });
+  console.log('\nDownload complete.');
   await downloadSubtitleMovie(imdbId, base);
 }
 
@@ -606,39 +728,54 @@ async function handleShowWithPahe(imdbId, title, originalTitle, rl) {
 
   if (epStr.trim().toLowerCase() === 'all') {
     rl.close();
+    const manager = new DownloadManager(config.threads);
     for (const ep of episodes) {
-      const epNum = ep.episode;
-      console.log(`\n--- S${season}E${epNum} ---`);
-      try {
-        const links = await paheExtractLinks(animeSession, ep.session);
-        if (!links.length) { console.error(`[Pahe] No links for episode ${epNum}`); continue; }
-        const best = links.find(l => l.quality.includes('1080'))
-                  || links.find(l => l.quality.includes('720'))
-                  || links[0];
-        const m3u8 = await paheExtractM3U8(best.url);
-        const dir  = `./${cleanTitle}/Season_${season}`;
-        fs.mkdirSync(dir, { recursive: true });
-        const base = `${dir}/${cleanTitle}-S${season}-E${epNum}`;
-        downloadStream(m3u8, `${base}.mp4`, { Referer: 'https://kwik.si/' });
-        await downloadSubtitle(title, season, epNum, base);
-      } catch (err) {
-        console.error(`[Pahe] Skipping S${season}E${epNum}: ${err.message}`);
-      }
+      manager.addTask({
+        season,
+        episode: ep.episode,
+        session: ep.session,
+        baseDir: `./${cleanTitle}/Season_${season}`,
+        fileNameBase: `./${cleanTitle}/Season_${season}/${cleanTitle}-S${season}-E${ep.episode}`,
+        animeSession,
+      });
     }
+
+    console.log(`\nStarting bulk download (${manager.tasks.length} episodes) with ${config.threads} threads...`);
+    manager.startBulk();
+
+    const sourceFn = async (task) => {
+      const links = await paheExtractLinks(task.animeSession, task.session);
+      if (!links.length) return null;
+      const best = links.find(l => l.quality.includes('1080'))
+                || links.find(l => l.quality.includes('720'))
+                || links[0];
+      return await paheExtractM3U8(best.url);
+    };
+
+    const workers = Array.from({ length: config.threads }, (_, i) => 
+      downloadWorker(i + 1, manager, title, sourceFn)
+    );
+    await Promise.all(workers);
+    console.log('\nAll downloads completed.');
   } else {
     const epNum = parseInt(epStr);
     rl.close();
     const ep = episodes.find(e => e.episode === epNum);
     if (!ep) { console.error(`[Pahe] Episode ${epNum} not found.`); return; }
+    
+    console.log(`\nFetching S${season}E${epNum}...`);
     const links = await paheExtractLinks(animeSession, ep.session);
     if (!links.length) { console.error('[Pahe] No download links found.'); return; }
     const best = links.find(l => l.quality.includes('1080'))
               || links.find(l => l.quality.includes('720'))
               || links[0];
-    console.log(`[Pahe] Extracting M3U8 (quality: ${best.quality})...`);
     const m3u8 = await paheExtractM3U8(best.url);
     const base = `./${cleanTitle}-S${season}-E${epNum}`;
-    downloadStream(m3u8, `${base}.mp4`, { Referer: 'https://kwik.si/' });
+    
+    await downloadStream(m3u8, `${base}.mp4`, { Referer: 'https://kwik.si/' }, (p) => {
+      process.stdout.write(`\rStatus: Downloading... `);
+    });
+    console.log('\nDownload complete.');
     await downloadSubtitle(title, season, epNum, base);
   }
 }
@@ -674,7 +811,11 @@ async function handleShow(imdbId, title, originalTitle, epsData) {
         const urls = epRes?.data?.stream_urls || [];
         if (urls.length) {
           const base = `./${cleanTitle}-S${chosenSeason}-E${chosenEp}`;
-          downloadStream(urls[0], `${base}.mp4`);
+          console.log(`\nDownloading S${chosenSeason}E${chosenEp}...`);
+          await downloadStream(urls[0], `${base}.mp4`, {}, (p) => {
+            process.stdout.write(`\rStatus: Downloading... `);
+          });
+          console.log('\nDownload complete.');
           await downloadSubtitle(title, parseInt(chosenSeason), chosenEp, base);
         } else {
           console.error('No stream found via primary source.');
@@ -684,28 +825,36 @@ async function handleShow(imdbId, title, originalTitle, epsData) {
       }
     } else if (mode === 2) {
       rl.close();
-      console.log('\nStarting bulk download queue...');
+      const manager = new DownloadManager(config.threads);
       for (const seasonNum of seasons) {
         const epList = epsData[seasonNum];
         const epCount = Array.isArray(epList) ? epList.length : parseInt(epList) || 0;
         for (let ep = 1; ep <= epCount; ep++) {
-          console.log(`\n--- Fetching S${seasonNum}E${ep} ---`);
-          const epUrl = `https://streamdata.vaplayer.ru/api.php?imdb=${imdbId}&type=tv&season=${seasonNum}&episode=${ep}`;
-          try {
-            const epRes = JSON.parse(stripToJSON(await fetchURL(epUrl)));
-            const urls = epRes?.data?.stream_urls || [];
-            if (urls.length) {
-              const dir  = `./${cleanTitle}/Season_${seasonNum}`;
-              fs.mkdirSync(dir, { recursive: true });
-              const base = `${dir}/${cleanTitle}-S${seasonNum}-E${ep}`;
-              downloadStream(urls[0], `${base}.mp4`);
-              await downloadSubtitle(title, parseInt(seasonNum), ep, base);
-            }
-          } catch {
-            console.error(`Skipping S${seasonNum}E${ep} due to error.`);
-          }
+          manager.addTask({
+            season: seasonNum,
+            episode: ep,
+            baseDir: `./${cleanTitle}/Season_${seasonNum}`,
+            fileNameBase: `./${cleanTitle}/Season_${seasonNum}/${cleanTitle}-S${seasonNum}-E${ep}`,
+            imdbId,
+          });
         }
       }
+
+      console.log(`\nStarting bulk download (${manager.tasks.length} episodes) with ${config.threads} threads...`);
+      manager.startBulk();
+
+      const sourceFn = async (task) => {
+        const epUrl = `https://streamdata.vaplayer.ru/api.php?imdb=${task.imdbId}&type=tv&season=${task.season}&episode=${task.episode}`;
+        const raw = await fetchURL(epUrl);
+        const res = JSON.parse(stripToJSON(raw));
+        return res?.data?.stream_urls?.[0] || null;
+      };
+
+      const workers = Array.from({ length: config.threads }, (_, i) => 
+        downloadWorker(i + 1, manager, title, sourceFn)
+      );
+      await Promise.all(workers);
+      console.log('\nAll downloads completed.');
     } else {
       rl.close();
       console.error('Invalid option.');
@@ -757,11 +906,13 @@ async function main() {
     .option('--no-subs', 'Skip subtitle download entirely')
     .option('--embed-subs', 'Mux subtitle track into the .mp4 using ffmpeg (removes .srt)')
     .option('--lang <language>', 'Subtitle language', 'English')
+    .option('-t, --threads <number>', 'Number of concurrent downloads', '3')
     .addHelpText('after', `
 Examples:
   $ imdbdownloader tt0480489
   $ node downloader.js tt0480489 --embed-subs
   $ node downloader.js tt0480489 --lang Japanese
+  $ node downloader.js tt0480489 --threads 5
   $ node downloader.js tt0480489 --no-subs
 
 Note: when using "npm start", pass flags after "--":
@@ -775,6 +926,7 @@ Note: when using "npm start", pass flags after "--":
   config.noSubs    = opts.subs === false;
   config.embedSubs = opts.embedSubs || false;
   config.subLang   = opts.lang || 'English';
+  config.threads   = parseInt(opts.threads) || 3;
 
   if (!checkDependencies()) process.exit(1);
 
