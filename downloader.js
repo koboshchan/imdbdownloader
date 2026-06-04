@@ -614,14 +614,14 @@ async function downloadSubtitleMovie(imdbId, outputBase) {
 
 // ── Video downloader ──────────────────────────────────────────────────────────
 
-async function downloadStream(m3u8Url, outputPath, extraHeaders = {}, onProgress = null) {
+async function downloadStream(m3u8Url, outputPath, extraHeaders = {}, onProgress = null, threads = 1) {
   const userAgent = extraHeaders['User-Agent']
     || 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:152.0) Gecko/20100101 Firefox/152.0';
   const referer = extraHeaders['Referer'] || 'https://brightpathsignals.com/';
   const args = [
     '--user-agent', userAgent,
     '--referer', referer,
-    '--downloader', 'ffmpeg',
+    '--concurrent-fragments', String(threads),
     '--newline',
     m3u8Url,
     '-o', outputPath,
@@ -671,7 +671,7 @@ async function downloadWorker(workerId, manager, title, streamSourceFn) {
 
       await downloadStream(m3u8, outputPath, extraHeaders || {}, (p) => {
         manager.updateWorker(workerId, { progress: p });
-      });
+      }, 1);
 
       manager.updateWorker(workerId, { status: 'Muxing', progress: 100 });
       await downloadSubtitle(title, parseInt(season), episode, fileNameBase, true);
@@ -698,7 +698,7 @@ async function handleMovie(imdbId, title, streamUrls) {
   
   await downloadStream(streamUrls[0], `${base}.mp4`, {}, (p) => {
     process.stdout.write(`\rStatus: Downloading... `);
-  });
+  }, config.threads);
   console.log('\nDownload complete.');
   await downloadSubtitleMovie(imdbId, base);
 }
@@ -774,7 +774,7 @@ async function handleShowWithPahe(imdbId, title, originalTitle, rl) {
     
     await downloadStream(m3u8, `${base}.mp4`, { Referer: 'https://kwik.si/' }, (p) => {
       process.stdout.write(`\rStatus: Downloading... `);
-    });
+    }, config.threads);
     console.log('\nDownload complete.');
     await downloadSubtitle(title, season, epNum, base);
   }
@@ -814,7 +814,7 @@ async function handleShow(imdbId, title, originalTitle, epsData) {
           console.log(`\nDownloading S${chosenSeason}E${chosenEp}...`);
           await downloadStream(urls[0], `${base}.mp4`, {}, (p) => {
             process.stdout.write(`\rStatus: Downloading... `);
-          });
+          }, config.threads);
           console.log('\nDownload complete.');
           await downloadSubtitle(title, parseInt(chosenSeason), chosenEp, base);
         } else {
