@@ -70,10 +70,18 @@ class DownloadManager {
   render() {
     if (!this.isBulk) return;
 
-    // Move cursor up to overwrite previous lines
-    const lines = this.workerStatus.length * 2;
+    const completed = this.tasks.filter(t => t.downloaded).length;
+    const total = this.tasks.length;
+    const percent = total > 0 ? Math.floor((completed / total) * 100) : 0;
+    const bar = '[' + '#'.repeat(completed) + '-'.repeat(total - completed) + ']';
+
+    // Move cursor up to overwrite previous lines (2 for total progress + 2 per thread)
+    const lines = (this.workerStatus.length * 2) + 2;
     readline.cursorTo(process.stdout, 0);
     readline.moveCursor(process.stdout, 0, -lines);
+
+    // Render Total Progress
+    process.stdout.write(`\x1b[KTotal Progress: ${bar} ${percent}% (${completed}/${total} episodes)\n\x1b[K\n`);
 
     for (const w of this.workerStatus) {
       const taskLabel = w.currentTask ? `S${w.currentTask.season}E${w.currentTask.episode}` : 'None';
@@ -86,8 +94,8 @@ class DownloadManager {
 
   startBulk() {
     this.isBulk = true;
-    // Prepare space for progress bars
-    for (let i = 0; i < this.threads * 2; i++) process.stdout.write('\n');
+    // Prepare space for progress bars (2 for total progress + 2 per thread)
+    for (let i = 0; i < (this.threads * 2) + 2; i++) process.stdout.write('\n');
     this.render();
   }
 }
