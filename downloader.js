@@ -19,6 +19,7 @@ const config = {
   embedSubs: false,
   subLang: 'English',
   threads: 3,
+  fragments: 8,
 };
 
 const SUB_BASE      = 'https://feliratok.eu/index.php';
@@ -614,14 +615,14 @@ async function downloadSubtitleMovie(imdbId, outputBase) {
 
 // ── Video downloader ──────────────────────────────────────────────────────────
 
-async function downloadStream(m3u8Url, outputPath, extraHeaders = {}, onProgress = null, threads = 1) {
+async function downloadStream(m3u8Url, outputPath, extraHeaders = {}, onProgress = null, fragments = 8) {
   const userAgent = extraHeaders['User-Agent']
     || 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:152.0) Gecko/20100101 Firefox/152.0';
   const referer = extraHeaders['Referer'] || 'https://brightpathsignals.com/';
   const args = [
     '--user-agent', userAgent,
     '--referer', referer,
-    '--concurrent-fragments', String(threads),
+    '--concurrent-fragments', String(fragments),
     '--newline',
     m3u8Url,
     '-o', outputPath,
@@ -632,6 +633,7 @@ async function downloadStream(m3u8Url, outputPath, extraHeaders = {}, onProgress
 
     child.stdout.on('data', (data) => {
       const line = data.toString();
+      process.stdout.write(line);
       if (onProgress) {
         // [download]  10.0% of ~20.00MiB at  2.00MiB/s ETA 00:10
         const match = /\[download\]\s+(\d+\.\d+)%/.exec(line);
@@ -671,7 +673,7 @@ async function downloadWorker(workerId, manager, title, streamSourceFn) {
 
       await downloadStream(m3u8, outputPath, extraHeaders || {}, (p) => {
         manager.updateWorker(workerId, { progress: p });
-      }, 1);
+      }, config.fragments);
 
       manager.updateWorker(workerId, { status: 'Muxing', progress: 100 });
       await downloadSubtitle(title, parseInt(season), episode, fileNameBase, true);
@@ -696,9 +698,7 @@ async function handleMovie(imdbId, title, streamUrls) {
   console.log(`\nFound Movie: ${title}`);
   console.log(`Downloading to ${base}.mp4...`);
   
-  await downloadStream(streamUrls[0], `${base}.mp4`, {}, (p) => {
-    process.stdout.write(`\rStatus: Downloading... `);
-  }, config.threads);
+  await downloadStream(streamUrls[0], `${base}.mp4`, {}, null, config.fragments);
   console.log('\nDownload complete.');
   await downloadSubtitleMovie(imdbId, base);
 }
@@ -772,9 +772,7 @@ async function handleShowWithPahe(imdbId, title, originalTitle, rl) {
     const m3u8 = await paheExtractM3U8(best.url);
     const base = `./${cleanTitle}-S${season}-E${epNum}`;
     
-    await downloadStream(m3u8, `${base}.mp4`, { Referer: 'https://kwik.si/' }, (p) => {
-      process.stdout.write(`\rStatus: Downloading... `);
-    }, config.threads);
+    await downloadStream(m3u8, `${base}.mp4`, { Referer: 'https://kwik.si/' }, null, config.fragments);
     console.log('\nDownload complete.');
     await downloadSubtitle(title, season, epNum, base);
   }
@@ -812,9 +810,7 @@ async function handleShow(imdbId, title, originalTitle, epsData) {
         if (urls.length) {
           const base = `./${cleanTitle}-S${chosenSeason}-E${chosenEp}`;
           console.log(`\nDownloading S${chosenSeason}E${chosenEp}...`);
-          await downloadStream(urls[0], `${base}.mp4`, {}, (p) => {
-            process.stdout.write(`\rStatus: Downloading... `);
-          }, config.threads);
+          await downloadStream(urls[0], `${base}.mp4`, {}, null, config.fragments);
           console.log('\nDownload complete.');
           await downloadSubtitle(title, parseInt(chosenSeason), chosenEp, base);
         } else {
@@ -906,7 +902,8 @@ async function main() {
     .option('--no-subs', 'Skip subtitle download entirely')
     .option('--embed-subs', 'Mux subtitle track into the .mp4 using ffmpeg (removes .srt)')
     .option('--lang <language>', 'Subtitle language', 'English')
-    .option('-t, --threads <number>', 'Number of concurrent downloads', '3')
+    .option('-t, --threads <number>', 'Number of concurrent downloads (shows only)', '3')
+    .option('--concurrent-fragments <number>', 'Number of concurrent fragments per download', '8')
     .addHelpText('after', `
 Examples:
   $ imdbdownloader tt0480489
@@ -927,6 +924,7 @@ Note: when using "npm start", pass flags after "--":
   config.embedSubs = opts.embedSubs || false;
   config.subLang   = opts.lang || 'English';
   config.threads   = parseInt(opts.threads) || 3;
+  config.fragments = parseInt(opts.concurrentFragments) || 8;
 
   if (!checkDependencies()) process.exit(1);
 
