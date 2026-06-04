@@ -77,7 +77,13 @@ class DownloadManager {
     const processed = completed + failed;
     const percent = total > 0 ? Math.floor((processed / total) * 100) : 0;
     
-    const barWidth = Math.floor((process.stdout.columns || 80) * 0.85);
+    const terminalWidth = process.stdout.columns || 80;
+    const failedText = failed > 0 ? `, ${failed} failed` : '';
+    const statusText = ` ${percent}% (${processed}/${total} episodes${failedText})`;
+    const prefix = "Total Progress: ";
+    
+    // Calculate remaining space for the bar (2 accounts for '[' and ']')
+    const barWidth = Math.max(10, terminalWidth - prefix.length - statusText.length - 2);
     const filledWidth = total > 0 ? Math.floor((processed / total) * barWidth) : 0;
     const bar = '[' + '#'.repeat(filledWidth) + '-'.repeat(barWidth - filledWidth) + ']';
 
@@ -87,15 +93,15 @@ class DownloadManager {
     readline.moveCursor(process.stdout, 0, -lines);
 
     // Render Total Progress
-    const failedText = failed > 0 ? `, ${failed} failed` : '';
-    process.stdout.write(`\x1b[KTotal Progress: ${bar} ${percent}% (${processed}/${total} episodes${failedText})\n\x1b[K\n`);
+    process.stdout.write(`\x1b[K${prefix}${bar}${statusText}\n\x1b[K\n`);
 
     for (const w of this.workerStatus) {
       const taskLabel = w.currentTask ? `S${w.currentTask.season}E${w.currentTask.episode}` : 'None';
       
-      process.stdout.write(`\x1b[KThread ${w.id}: ${taskLabel.padEnd(8)} | [${w.status}]\n`);
+      const statusLine = `Thread ${w.id}: ${taskLabel.padEnd(8)} | [${w.status}]`;
+      process.stdout.write(`\x1b[K${statusLine.slice(0, terminalWidth)}\n`);
       const out = w.lastOutput || '';
-      process.stdout.write(`\x1b[K  ${out.slice(0, (process.stdout.columns || 80) - 4)}\n`);
+      process.stdout.write(`\x1b[K  ${out.slice(0, terminalWidth - 4)}\n`);
     }
   }
 
