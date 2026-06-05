@@ -111,7 +111,10 @@ class DownloadManager {
 async function fetchAniApi(pathname) {
   try {
     const res = await axios.get(`${ANIAPI_BASE}${pathname}`, {
-      headers: { 'x-api-key': config.apiKey },
+      headers: { 
+        'x-api-key': config.apiKey,
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:152.0) Gecko/20100101 Firefox/152.0'
+      },
       timeout: 30000,
     });
     return res.data || null;
@@ -150,7 +153,7 @@ async function fetchImdbMetadata(imdbId) {
 }
 
 function isShowType(type) {
-  return /series|mini|episode|special/i.test(type);
+  return /show|series|tv|mini|episode|special/i.test(type);
 }
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
@@ -426,7 +429,7 @@ Note: when using "npm start", pass flags after "--":
 
   config.threads   = parseInt(opts.threads) || 3;
   config.fragments = parseInt(opts.concurrentFragments) || 8;
-  config.apiKey    = (opts.key || process.env.ANIAPI_TOKEN || '').trim();
+  config.apiKey    = (opts.key || process.env.ANIAPI_TOKEN || '').toString().trim().replace(/['"]/g, '');
 
   if (!config.apiKey) {
     console.error('Error: API key required. Contact @kobosh_com on telegram/@kobosh.com on discord for a api key');

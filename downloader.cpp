@@ -1,41 +1,58 @@
 #include <iostream>
 #include <string>
 #include <vector>
-#include <cstdlib>
+#include <mutex>
+#include <thread>
+#include <atomic>
 #include <sstream>
-#include <memory>
-#include <algorithm>
-#include <cstdio>
+#include <iomanip>
+#include <filesystem>
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
+#include <sys/ioctl.h>
+#include <unistd.h>
+#include <regex>
 
 using json = nlohmann::json;
+namespace fs = std::filesystem;
 
-// ── Global flags ─────────────────────────────────────────────────────────────
-bool g_noSubs = false;
-bool g_embedSubs = false;
-std::string g_subLang = "English"; // preferred subtitle language (English name)
+// ── Global config ─────────────────────────────────────────────────────────────
 
-// ── Generic write-to-string callback ─────────────────────────────────────────
-size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* userp) {
-    ((std::string*)userp)->append((char*)contents, size * nmemb);
-    return size * nmemb;
-}
+struct Config {
+    int threads = 3;
+    int fragments = 8;
+    std::string apiKey;
+} g_config;
 
-// Strip leading non-JSON content (e.g. PHP warnings) — find first '{' or '['
+const std::string ANIAPI_BASE = "https://aniapi.kobosh.com";
+
+// ── Utilities ─────────────────────────────────────────────────────────────────
+
 std::string stripToJSON(const std::string& s) {
     size_t p = s.find_first_of("{[");
     if (p == std::string::npos) return s;
     return s.substr(p);
 }
 
-// ── Write-to-FILE callback (for binary subtitle downloads) ───────────────────
-size_t WriteFileCallback(void* contents, size_t size, size_t nmemb, void* userp) {
-    return fwrite(contents, size, nmemb, (FILE*)userp);
+std::string trim(const std::string& s) {
+    auto start = s.find_first_not_of(" \t\n\r\"'");
+    if (start == std::string::npos) return "";
+    auto end = s.find_last_not_of(" \t\n\r\"'");
+    return s.substr(start, end - start + 1);
 }
 
-// ── Stream downloader (video API) ────────────────────────────────────────────
-std::string fetchURL(const std::string& url) {
+std::string sanitizeFilename(std::string name) {
+    std::replace(name.begin(), name.end(), ' ', '_');
+    std::regex re("[^a-zA-Z0-9_\\-]");
+    return std::regex_replace(name, re, "");
+}
+
+size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* userp) {
+    ((std::string*)userp)->append((char*)contents, size * nmemb);
+    return size * nmemb;
+}
+
+std::string fetchURL(const std::string& url, const std::string& apiKey) {
     CURL* curl;
     CURLcode res;
     std::string readBuffer;
@@ -44,707 +61,479 @@ std::string fetchURL(const std::string& url) {
     if (curl) {
         struct curl_slist* headers = NULL;
         headers = curl_slist_append(headers, "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:152.0) Gecko/20100101 Firefox/152.0");
-        headers = curl_slist_append(headers, "Referer: https://brightpathsignals.com/");
-
+        if (!apiKey.empty()) {
+            headers = curl_slist_append(headers, ("x-api-key: " + apiKey).c_str());
+        }
         curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &readBuffer);
         curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
 
         res = curl_easy_perform(curl);
         curl_slist_free_all(headers);
         curl_easy_cleanup(curl);
 
         if (res != CURLE_OK) {
-            std::cerr << "CURL Error: " << curl_easy_strerror(res) << std::endl;
+            throw std::runtime_error("CURL Error: " + std::string(curl_easy_strerror(res)));
         }
     }
     return readBuffer;
 }
 
-// ── Subtitle API helpers (feliratok.eu) ───────────────────────────────────────
-const std::string SUB_BASE = "https://feliratok.eu/index.php";
+// ── Download Management & UI ──────────────────────────────────────────────────
 
-std::string urlEncode(const std::string& value) {
-    CURL* curl = curl_easy_init();
-    if (!curl) return value;
-    char* enc = curl_easy_escape(curl, value.c_str(), (int)value.size());
-    std::string result(enc);
-    curl_free(enc);
-    curl_easy_cleanup(curl);
-    return result;
-}
-
-std::string fetchSubAPI(const std::string& query_params) {
-    std::string url = SUB_BASE + "?" + query_params;
-    CURL* curl = curl_easy_init();
-    std::string buffer;
-    if (curl) {
-        struct curl_slist* headers = NULL;
-        headers = curl_slist_append(headers, "User-Agent: xbmc subtitle plugin");
-        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buffer);
-        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-        curl_easy_perform(curl);
-        curl_slist_free_all(headers);
-        curl_easy_cleanup(curl);
-    }
-    return buffer;
-}
-
-bool downloadBinaryFile(const std::string& url, const std::string& filepath) {
-    CURL* curl = curl_easy_init();
-    if (!curl) return false;
-    FILE* fp = fopen(filepath.c_str(), "wb");
-    if (!fp) { curl_easy_cleanup(curl); return false; }
-    struct curl_slist* headers = NULL;
-    headers = curl_slist_append(headers, "User-Agent: xbmc subtitle plugin");
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteFileCallback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    CURLcode res = curl_easy_perform(curl);
-    fclose(fp);
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
-    return res == CURLE_OK;
-}
-
-// Map English language name → Hungarian (feliratok.eu uses Hungarian lang keys)
-static const std::vector<std::pair<std::string,std::string>> LANG_MAP = {
-    {"English","angol"}, {"Hungarian","magyar"}, {"Spanish","spanyol"},
-    {"French","francia"}, {"German","német"}, {"Italian","olasz"},
-    {"Japanese","japán"}, {"Portuguese","portugál"}, {"Russian","orosz"},
-    {"Chinese","kínai"}, {"Korean","koreai"}, {"Arabic","arab"},
-    {"Dutch","holland"}, {"Polish","lengyel"}, {"Turkish","török"},
-    {"Romanian","román"}, {"Croatian","horvát"}, {"Serbian","szerb"},
-    {"Czech","cseh"}, {"Greek","görög"}, {"Swedish","svéd"},
-    {"Norwegian","norvég"}, {"Danish","dán"}, {"Finnish","finn"},
+struct Task {
+    std::string season;
+    int episode;
+    std::string baseDir;
+    std::string fileNameBase;
+    std::string imdbId;
+    bool downloaded = false;
+    int claimedBy = -1; // -1 for unclaimed
+    bool failed = false;
 };
 
-std::string engToHun(const std::string& eng) {
-    for (auto& p : LANG_MAP)
-        if (p.first == eng) return p.second;
-    return "";
+struct WorkerStatus {
+    int id;
+    std::string status = "Idle";
+    double progress = 0;
+    Task* currentTask = nullptr;
+    std::string lastOutput;
+};
+
+class DownloadManager {
+public:
+    std::vector<Task> tasks;
+    std::vector<WorkerStatus> workerStatus;
+    std::mutex mtx;
+    bool isBulk = false;
+    int threadCount;
+
+    DownloadManager(int threads) : threadCount(threads) {
+        for (int i = 0; i < threads; ++i) {
+            workerStatus.push_back({i + 1});
+        }
+    }
+
+    void addTask(Task task) {
+        tasks.push_back(task);
+    }
+
+    Task* claimTask(int workerId) {
+        std::lock_guard<std::mutex> lock(mtx);
+        for (auto& t : tasks) {
+            if (t.claimedBy == -1 && !t.downloaded && !t.failed) {
+                t.claimedBy = workerId;
+                return &t;
+            }
+        }
+        return nullptr;
+    }
+
+    void updateWorker(int workerId, std::string status, double progress, Task* task, std::string lastOut = "") {
+        std::lock_guard<std::mutex> lock(mtx);
+        for (auto& w : workerStatus) {
+            if (w.id == workerId) {
+                w.status = status;
+                w.progress = progress;
+                if (task) w.currentTask = task;
+                if (!lastOut.empty()) w.lastOutput = lastOut;
+                break;
+            }
+        }
+        render();
+    }
+
+    void render() {
+        if (!isBulk) return;
+
+        int completed = 0;
+        int failed = 0;
+        for (const auto& t : tasks) {
+            if (t.downloaded) completed++;
+            if (t.failed) failed++;
+        }
+        int total = tasks.size();
+        int processed = completed + failed;
+        int percent = total > 0 ? (processed * 100 / total) : 0;
+
+        struct winsize w;
+        ioctl(STDOUT_FILENO, TIOCGWINSZ, &w);
+        int terminalWidth = w.ws_col > 0 ? w.ws_col : 80;
+
+        std::string failedText = failed > 0 ? ", " + std::to_string(failed) + " failed" : "";
+        std::string statusText = " " + std::to_string(percent) + "% (" + std::to_string(processed) + "/" + std::to_string(total) + " episodes" + failedText + ")";
+        std::string prefix = "Total Progress: ";
+
+        int barWidth = std::max(10, terminalWidth - (int)prefix.length() - (int)statusText.length() - 2);
+        int filledWidth = total > 0 ? (processed * barWidth / total) : 0;
+        std::string bar = "[" + std::string(filledWidth, '#') + std::string(barWidth - filledWidth, '-') + "]";
+
+        int linesToMove = (workerStatus.size() * 2) + 2;
+        
+        // Move cursor up
+        std::cout << "\x1b[" << linesToMove << "A" << "\x1b[G";
+
+        // Render Total Progress
+        std::cout << "\x1b[K" << prefix << bar << statusText << "\n\x1b[K\n";
+
+        for (const auto& ws : workerStatus) {
+            std::string taskLabel = ws.currentTask ? "S" + ws.currentTask->season + "E" + std::to_string(ws.currentTask->episode) : "None";
+            std::string statusLine = "Thread " + std::to_string(ws.id) + ": " + taskLabel;
+            while(statusLine.length() < 18) statusLine += " ";
+            statusLine += " | [" + ws.status + "]";
+            
+            if (statusLine.length() > (size_t)terminalWidth) statusLine = statusLine.substr(0, terminalWidth);
+            std::cout << "\x1b[K" << statusLine << "\n";
+            
+            std::string out = ws.lastOutput;
+            if (out.length() > (size_t)terminalWidth - 4) out = out.substr(0, terminalWidth - 4);
+            std::cout << "\x1b[K  " << out << "\n";
+        }
+        std::cout.flush();
+    }
+
+    void startBulk() {
+        isBulk = true;
+        for (int i = 0; i < (threadCount * 2) + 2; ++i) std::cout << "\n";
+        render();
+    }
+};
+
+// ── AniAPI helpers ───────────────────────────────────────────────────────────
+
+json fetchAniApi(const std::string& pathname) {
+    std::string resp = fetchURL(ANIAPI_BASE + pathname, g_config.apiKey);
+    try {
+        return json::parse(stripToJSON(resp));
+    } catch (const std::exception& e) {
+        throw std::runtime_error("AniAPI response parse failed: " + std::string(e.what()) + "\nResponse: " + resp);
+    }
 }
 
-// Parse the HTML from action=search and return {feliratID, filename} pairs.
-// feliratok.eu returns HTML rather than JSON from this endpoint (action=xbmc
-// is Cloudflare-blocked), so we scrape the download links directly.
-std::vector<std::pair<std::string,std::string>> parseSubtitleHTML(const std::string& html) {
-    std::vector<std::pair<std::string,std::string>> results;
-    // Each download link looks like:
-    //   href="/index.php?action=letolt&fnev=Title.S01.rar&felirat=12345"
-    size_t pos = 0;
+struct Metadata {
+    std::string title;
+    std::string originalTitle;
+    std::string type;
+    std::vector<std::string> genres;
+    int startYear = 0;
+    json episodes;
+    bool hasPrimaryStream = true;
+};
+
+Metadata fetchImdbMetadata(const std::string& imdbId) {
+    try {
+        json d = fetchAniApi("/info/" + imdbId);
+        if (d.contains("error")) {
+            throw std::runtime_error(d["error"].get<std::string>());
+        }
+        Metadata m;
+        m.title = d.value("title", d.value("originalTitle", imdbId));
+        m.originalTitle = d.value("originalTitle", d.value("title", imdbId));
+        m.type = d.value("mediaType", d.value("type", "movie"));
+        if (d.contains("genres")) m.genres = d["genres"].get<std::vector<std::string>>();
+        m.startYear = d.value("year", 0);
+        if (d.contains("episodes")) m.episodes = d["episodes"];
+        m.hasPrimaryStream = d.value("hasPrimaryStream", true);
+        return m;
+    } catch (const std::exception& e) {
+        std::cerr << "[Meta] AniAPI lookup failed: " << e.what() << std::endl;
+        Metadata m;
+        m.title = imdbId;
+        m.originalTitle = imdbId;
+        m.type = "movie";
+        m.hasPrimaryStream = false;
+        return m;
+    }
+}
+
+bool isShowType(const std::string& type) {
+    std::regex re("show|series|tv|mini|episode|special", std::regex_constants::icase);
+    return std::regex_search(type, re);
+}
+
+// ── Video downloader ──────────────────────────────────────────────────────────
+
+void downloadStream(const std::string& m3u8Url, const std::string& outputPath, const json& extraHeaders, 
+                    int fragments, int workerId = 0, DownloadManager* manager = nullptr) {
+    
+    std::string userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:152.0) Gecko/20100101 Firefox/152.0";
+    if (extraHeaders.contains("User-Agent")) userAgent = extraHeaders["User-Agent"].get<std::string>();
+
+    std::string cmd = "yt-dlp --user-agent \"" + userAgent + "\" --concurrent-fragments " + std::to_string(fragments) + " --newline ";
+    
+    if (extraHeaders.contains("Referer")) {
+        cmd += "--referer \"" + extraHeaders["Referer"].get<std::string>() + "\" ";
+    }
+    
+    cmd += "\"" + m3u8Url + "\" -o \"" + outputPath + "\" 2>&1";
+
+    FILE* pipe = popen(cmd.c_str(), "r");
+    if (!pipe) throw std::runtime_error("Failed to run yt-dlp");
+
+    char buffer[1024];
+    std::regex progressRe("\\[download\\]\\s+([0-9]+\\.[0-9]+)%");
+    
+    while (fgets(buffer, sizeof(buffer), pipe) != NULL) {
+        std::string line(buffer);
+        if (line.back() == '\n') line.pop_back();
+        if (line.empty()) continue;
+
+        double progress = 0;
+        std::smatch match;
+        if (std::regex_search(line, match, progressRe)) {
+            progress = std::stod(match[1].str());
+        }
+
+        if (manager) {
+            manager->updateWorker(workerId, "Downloading", progress, nullptr, line);
+        } else {
+            std::cout << "\r\x1b[KStatus: Downloading... " << line << std::flush;
+        }
+    }
+
+    int result = pclose(pipe);
+    if (result != 0) throw std::runtime_error("yt-dlp failed with code " + std::to_string(result));
+}
+
+// ── Content handlers ──────────────────────────────────────────────────────────
+
+void downloadWorker(int workerId, DownloadManager* manager) {
     while (true) {
-        size_t fnev_pos = html.find("fnev=", pos);
-        if (fnev_pos == std::string::npos) break;
-        size_t fnev_start = fnev_pos + 5;
-        size_t fnev_end   = html.find_first_of("\"&\r\n", fnev_start);
-        if (fnev_end == std::string::npos) break;
-        std::string filename = html.substr(fnev_start, fnev_end - fnev_start);
+        Task* task = manager->claimTask(workerId);
+        if (!task) break;
 
-        size_t id_pos = html.find("felirat=", fnev_end);
-        if (id_pos == std::string::npos) break;
-        size_t id_start = id_pos + 8;
-        size_t id_end   = html.find_first_of("\"&\r\n", id_start);
-        if (id_end == std::string::npos) break;
-        std::string subId = html.substr(id_start, id_end - id_start);
+        manager->updateWorker(workerId, "Downloading", 0, task);
 
-        results.push_back({subId, filename});
-        pos = id_end;
-    }
-    return results;
-}
+        try {
+            json epRes = fetchAniApi("/download/show/" + task->imdbId + "/" + task->season + "/" + std::to_string(task->episode));
+            std::string m3u8 = epRes.value("streamUrl", "");
+            json headers = epRes.value("headers", json::object());
 
-// After extracting an archive that may be a season pack, find the .srt/.sub
-// for the specific episode number inside extractDir.
-std::string findEpisodeSubtitle(const std::string& extractDir, int episode) {
-    // Build a shell command that lists candidates and scores them:
-    // 1. Prefer exact episode match (e.g. "- 02 -", "E02", "_02_", " 2 ")
-    // 2. Fall back to first .srt/.sub
-    char epBuf[16];
-    snprintf(epBuf, sizeof(epBuf), "%02d", episode);
-    std::string ep2  = epBuf;                    // "02"
-    std::string ep1  = std::to_string(episode);  // "2"
+            if (m3u8.empty()) throw std::runtime_error("No stream URL");
 
-    // List all subtitle files in the dir
-    std::string listCmd = "find \"" + extractDir + "\" -maxdepth 5 \\( -name '*.srt' -o -name '*.sub' \\) 2>/dev/null";
-    FILE* pipe = popen(listCmd.c_str(), "r");
-    if (!pipe) return "";
+            fs::create_directories(task->baseDir);
+            std::string outputPath = task->fileNameBase + ".mp4";
 
-    std::vector<std::string> files;
-    char buf[1024];
-    while (fgets(buf, sizeof(buf), pipe)) {
-        std::string f(buf);
-        if (!f.empty() && f.back() == '\n') f.pop_back();
-        files.push_back(f);
-    }
-    pclose(pipe);
+            downloadStream(m3u8, outputPath, headers, g_config.fragments, workerId, manager);
 
-    // Score each file by how well it matches the episode number
-    std::string best;
-    int bestScore = -1;
-    for (auto& f : files) {
-        // Lowercase filename for matching
-        std::string lf = f;
-        std::transform(lf.begin(), lf.end(), lf.begin(), ::tolower);
-        int score = 0;
-        // Strong match: "- 02 -" or "e02" or "_02_" or ".02."
-        if (lf.find("- " + ep2 + " -") != std::string::npos) score = 10;
-        else if (lf.find("e" + ep2) != std::string::npos)     score = 9;
-        else if (lf.find("_" + ep2 + "_") != std::string::npos) score = 8;
-        else if (lf.find("." + ep2 + ".") != std::string::npos) score = 7;
-        else if (lf.find("- " + ep1 + " -") != std::string::npos) score = 6;
-        else if (lf.find("e" + ep1 + ".") != std::string::npos)    score = 5;
-        // Non-zero score means it's a candidate
-        if (score > bestScore) { bestScore = score; best = f; }
-        else if (bestScore < 0) best = f; // fallback: take the first one
-    }
-    return best;
-}
-
-// Extract a subtitle archive (zip/rar) and return path to the episode's .srt.
-// If the extraction directory already exists from a prior call (season-pack cache),
-// skip re-extraction and just search for the right episode file.
-std::string extractSubtitleArchive(const std::string& archivePath, const std::string& subId, int episode) {
-    std::string extractDir = "/tmp/imdbsub_" + subId + "/";
-
-    // Reuse a previously extracted season pack if it's still present
-    std::string listCheck = "find \"" + extractDir + "\" -maxdepth 5 \\( -name '*.srt' -o -name '*.sub' \\) 2>/dev/null | head -1";
-    FILE* chk = popen(listCheck.c_str(), "r");
-    bool alreadyExtracted = false;
-    if (chk) {
-        char buf[4];
-        alreadyExtracted = (fgets(buf, sizeof(buf), chk) != nullptr);
-        pclose(chk);
-    }
-
-    if (!alreadyExtracted) {
-        std::system(("rm -rf \"" + extractDir + "\" && mkdir -p \"" + extractDir + "\"").c_str());
-        std::system(("unar -D -no-directory -force-overwrite \"" + archivePath + "\" -o \"" + extractDir + "\" >/dev/null 2>&1").c_str());
-    }
-
-    return findEpisodeSubtitle(extractDir, episode);
-}
-
-// Strip trailing year "(YYYY)" or " YYYY" and trailing punctuation from a title
-std::string stripYear(const std::string& title) {
-    std::string t = title;
-    // Strip " YYYY" at end
-    if (t.size() >= 5) {
-        std::string end4 = t.substr(t.size() - 4);
-        if (t[t.size() - 5] == ' ' && std::all_of(end4.begin(), end4.end(), ::isdigit))
-            t = t.substr(0, t.size() - 5);
-        // Strip " (YYYY)" at end
-        else if (t.size() >= 7 && t.back() == ')') {
-            size_t p = t.rfind(" (");
-            if (p != std::string::npos && std::all_of(t.begin() + p + 2, t.end() - 1, ::isdigit))
-                t = t.substr(0, p);
+            task->downloaded = true;
+            manager->updateWorker(workerId, "Done", 100, task);
+        } catch (const std::exception& e) {
+            task->failed = true;
+            std::string msg = e.what();
+            if (msg.length() > 15) msg = msg.substr(0, 15);
+            manager->updateWorker(workerId, "Error: " + msg, 0, task);
         }
     }
-    // Strip trailing non-alphanumeric chars (e.g. trailing period in "Your Name.")
-    while (!t.empty() && !std::isalnum((unsigned char)t.back()))
-        t.pop_back();
-    return t;
+    manager->updateWorker(workerId, "Finished", 0, nullptr);
 }
 
-// After downloading a video to `outputBase`.mp4, fetch & save its subtitle.
-// For TV: pass season ≥ 1 and episode ≥ 1.  For movies: pass season=0, episode=0.
-void downloadSubtitle(const std::string& title, int season, int episode, const std::string& outputBase) {
-    if (g_noSubs) return;
-
-    std::string hunLang = engToHun(g_subLang);
-    std::cout << "\n[Subs] Searching for " << g_subLang << " subtitles on feliratok.eu..." << std::endl;
-
-    // 1. Resolve show/movie ID via autoname (this endpoint is not Cloudflare-blocked)
-    //    Strip the year from the title so feliratok.eu can find it (e.g. "Elfen Lied 2004" → "Elfen Lied")
-    std::string lookupTitle = stripYear(title);
-    std::string autoResp = fetchSubAPI("action=autoname&nyelv=0&term=" + urlEncode(lookupTitle));
-    if (autoResp.empty()) { std::cerr << "[Subs] autoname request failed.\n"; return; }
-
-    json autoData;
-    try { autoData = json::parse(autoResp); } catch (...) { std::cerr << "[Subs] Failed to parse autoname response.\n"; return; }
-    if (!autoData.is_array() || autoData.empty()) { std::cerr << "[Subs] No show ID found for \"" << title << "\".\n"; return; }
-
-    // Check for no-result sentinel "-100x"
-    if (autoData[0].value("ID", "") == "-100x") { std::cerr << "[Subs] Show not found on feliratok.eu.\n"; return; }
-
-    // Pick highest numeric ID (most recently added entry)
-    std::string showId = autoData[0]["ID"].get<std::string>();
-    for (auto& entry : autoData) {
-        std::string id = entry.value("ID", "0");
-        if (id != "-100x" && std::stoi(id) > std::stoi(showId))
-            showId = id;
-    }
-    std::cout << "[Subs] Show ID: " << showId << std::endl;
-
-    // 2. Search for subtitles via HTML (action=xbmc is Cloudflare-blocked; action=search returns HTML)
-    std::string searchParams = "action=search&sid=" + showId;
-    if (season  > 0) searchParams += "&ev=" + std::to_string(season);
-    if (episode > 0) searchParams += "&epizod=" + std::to_string(episode);
-    if (!hunLang.empty()) searchParams += "&nyelv=" + urlEncode(hunLang);
-
-    std::string html = fetchSubAPI(searchParams);
-    auto results = parseSubtitleHTML(html);
-
-    // Fallback: retry without language filter if nothing found
-    if (results.empty() && !hunLang.empty()) {
-        std::cout << "[Subs] No " << g_subLang << " subtitle found; retrying without language filter..." << std::endl;
-        std::string fallbackParams = "action=search&sid=" + showId;
-        if (season  > 0) fallbackParams += "&ev=" + std::to_string(season);
-        if (episode > 0) fallbackParams += "&epizod=" + std::to_string(episode);
-        html = fetchSubAPI(fallbackParams);
-        results = parseSubtitleHTML(html);
-    }
-
-    if (results.empty()) { std::cerr << "[Subs] No subtitles found.\n"; return; }
-
-    auto& [subId, subFile] = results[0];
-    std::cout << "[Subs] Found: " << subFile << " (ID " << subId << ")" << std::endl;
-
-    // 3. Download subtitle archive to /tmp (spaces in filename are safe here)
-    std::string safeName = subId + ".dl";
-    std::string tmpPath  = "/tmp/imdbsub_" + safeName;
-    std::string dlURL    = SUB_BASE + "?action=letolt&felirat=" + subId;
-
-    // Only re-download if the cached file is missing or empty
-    bool needDownload = true;
-    {
-        FILE* f = fopen(tmpPath.c_str(), "rb");
-        if (f) {
-            fseek(f, 0, SEEK_END);
-            needDownload = (ftell(f) < 100);  // treat tiny/empty files as invalid
-            fclose(f);
-        }
-    }
-    if (needDownload && !downloadBinaryFile(dlURL, tmpPath)) { std::cerr << "[Subs] Download failed.\n"; return; }
-
-    // Verify the downloaded file is non-empty
-    {
-        FILE* f = fopen(tmpPath.c_str(), "rb");
-        if (f) {
-            fseek(f, 0, SEEK_END);
-            long sz = ftell(f);
-            fclose(f);
-            if (sz < 100) { std::cerr << "[Subs] Downloaded archive is empty or invalid.\n"; std::remove(tmpPath.c_str()); return; }
-        }
-    }
-
-    // 4. Extract or move to final destination
-    std::string ext = subFile.size() > 4 ? subFile.substr(subFile.size() - 4) : "";
-    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-
-    if (ext == ".zip" || ext == ".rar") {
-        std::string extracted = extractSubtitleArchive(tmpPath, subId, episode > 0 ? episode : 1);
-        if (!extracted.empty()) {
-            std::string dest = outputBase + ".srt";
-            // rename may fail across filesystems; fall back to copy+remove
-            if (std::rename(extracted.c_str(), dest.c_str()) != 0) {
-                std::system(("cp \"" + extracted + "\" \"" + dest + "\"").c_str());
-                std::remove(extracted.c_str());
-            }
-            std::cout << "[Subs] Saved: " << dest << std::endl;
-        } else {
-            std::cerr << "[Subs] No .srt/.sub found inside archive.\n";
-            std::system(("rm -rf /tmp/imdbsub_" + subId + "/").c_str());
-            std::remove(tmpPath.c_str());
-            return;
-        }
-        // Keep the extraction directory as a cache for subsequent episodes in the same season pack.
-        // Only wipe it on failure.
-    } else {
-        // Plain .srt / .sub — just move it
-        std::string dest = outputBase + (ext.empty() ? ".srt" : ext);
-        if (std::rename(tmpPath.c_str(), dest.c_str()) != 0)
-            std::system(("cp \"" + tmpPath + "\" \"" + dest + "\"").c_str());
-        std::cout << "[Subs] Saved: " << dest << std::endl;
-        std::remove(tmpPath.c_str());
-    }
-
-    // 5. Optionally mux subtitle into the video with ffmpeg
-    if (g_embedSubs) {
-        std::string videoPath = outputBase + ".mp4";
-        std::string srtPath   = outputBase + ".srt";
-        std::string tmpMux    = outputBase + "_mux.mp4";
-        // Soft-subtitle mux: copy all streams, add subtitle track as mov_text
-        std::string muxCmd = "ffmpeg -y -i \"" + videoPath + "\" -i \"" + srtPath + "\""
-                             " -c:v copy -c:a copy -c:s mov_text"
-                             " -metadata:s:s:0 language=" + g_subLang +
-                             " \"" + tmpMux + "\" 2>&1";
-        std::cout << "[Subs] Muxing subtitle into video..." << std::endl;
-        int rc = std::system(muxCmd.c_str());
-        if (rc == 0) {
-            std::remove(videoPath.c_str());
-            if (std::rename(tmpMux.c_str(), videoPath.c_str()) != 0)
-                std::system(("mv \"" + tmpMux + "\" \"" + videoPath + "\"").c_str());
-            std::remove(srtPath.c_str());
-            std::cout << "[Subs] Embedded into: " << videoPath << std::endl;
-        } else {
-            std::cerr << "[Subs] ffmpeg mux failed; keeping standalone .srt\n";
-            std::remove(tmpMux.c_str());
-        }
-    }
-}
-
-// ── OpenSubtitles subtitle download (for movies) ─────────────────────────────
-
-// Map English language name to ISO 639-2/B code for OpenSubtitles
-std::string langToISO639(const std::string& lang) {
-    static const std::vector<std::pair<std::string,std::string>> map = {
-        {"English","eng"},{"Hungarian","hun"},{"French","fre"},{"German","ger"},
-        {"Spanish","spa"},{"Italian","ita"},{"Portuguese","por"},{"Russian","rus"},
-        {"Japanese","jpn"},{"Chinese","chi"},{"Korean","kor"},{"Dutch","dut"},
-        {"Polish","pol"},{"Swedish","swe"},{"Norwegian","nor"},{"Danish","dan"},
-        {"Finnish","fin"},{"Czech","cze"},{"Romanian","rum"},{"Turkish","tur"},
-        {"Arabic","ara"},{"Hebrew","heb"},{"Greek","ell"},{"Ukrainian","ukr"},
-    };
-    for (auto& [name, code] : map)
-        if (name == lang) return code;
-    return "eng"; // fallback
-}
-
-std::string fetchOpenSubtitles(const std::string& url) {
-    CURL* curl = curl_easy_init();
-    std::string buffer;
-    if (curl) {
-        struct curl_slist* headers = NULL;
-        headers = curl_slist_append(headers, "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:153.0) Gecko/20100101 Firefox/153.0");
-        headers = curl_slist_append(headers, "X-User-Agent: trailers.to-UA");
-        headers = curl_slist_append(headers, "Accept: */*");
-        headers = curl_slist_append(headers, "Referer: https://brightpathsignals.com/");
-        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buffer);
-        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-        curl_easy_perform(curl);
-        curl_slist_free_all(headers);
-        curl_easy_cleanup(curl);
-    }
-    return buffer;
-}
-
-bool downloadWyzie(const std::string& url, const std::string& filepath) {
-    CURL* curl = curl_easy_init();
-    if (!curl) return false;
-    FILE* fp = fopen(filepath.c_str(), "wb");
-    if (!fp) { curl_easy_cleanup(curl); return false; }
-    struct curl_slist* headers = NULL;
-    headers = curl_slist_append(headers, "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:153.0) Gecko/20100101 Firefox/153.0");
-    headers = curl_slist_append(headers, "Accept: */*");
-    headers = curl_slist_append(headers, "Referer: https://brightpathsignals.com/");
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteFileCallback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    CURLcode res = curl_easy_perform(curl);
-    fclose(fp);
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
-    return res == CURLE_OK;
-}
-
-// Download subtitle for a movie via OpenSubtitles search + wyzie.io delivery
-void downloadSubtitleMovie(const std::string& imdb_id_raw, const std::string& outputBase) {
-    if (g_noSubs) return;
-
-    // Strip leading "tt" and any leading zeros for OpenSubtitles imdbid path segment
-    std::string imdb_num = imdb_id_raw;
-    if (imdb_num.size() > 2 && imdb_num.substr(0,2) == "tt")
-        imdb_num = imdb_num.substr(2);
-    // Remove leading zeros
-    imdb_num.erase(0, imdb_num.find_first_not_of('0'));
-
-    std::string langCode = langToISO639(g_subLang);
-    std::string searchURL = "https://rest.opensubtitles.org/search/imdbid-" + imdb_num +
-                            "/sublanguageid-" + langCode;
-
-    std::cout << "\n[Subs] Searching OpenSubtitles for " << g_subLang << " subtitles..." << std::endl;
-    std::string raw = fetchOpenSubtitles(searchURL);
-    if (raw.empty()) { std::cerr << "[Subs] OpenSubtitles request failed.\n"; return; }
-
-    json results;
-    try { results = json::parse(raw); } catch (...) { std::cerr << "[Subs] Failed to parse OpenSubtitles response.\n"; return; }
-    if (!results.is_array() || results.empty()) { std::cerr << "[Subs] No subtitles found on OpenSubtitles.\n"; return; }
-
-    // Pick best result: prefer SubHD=1, then sort by download count
-    json best;
-    int bestScore = -1;
-    for (auto& s : results) {
-        int score = std::stoi(s.value("SubDownloadsCnt","0"))
-                  + (s.value("SubHD","0") == "1" ? 1000000 : 0)
-                  + (s.value("SubFromTrusted","0") == "1" ? 500000 : 0);
-        if (score > bestScore) { bestScore = score; best = s; }
-    }
-
-    std::string fileID  = best.value("IDSubtitleFile","");
-    std::string dlLink  = best.value("SubDownloadLink","");
-    std::string subFile = best.value("SubFileName","subtitle");
-    if (fileID.empty() || dlLink.empty()) { std::cerr << "[Subs] Missing subtitle file info.\n"; return; }
-
-    // Extract the 8-char VRF hash from SubDownloadLink (e.g. "vrf-19cc0c55")
-    std::string vrfHash;
-    size_t vrfPos = dlLink.find("vrf-");
-    if (vrfPos != std::string::npos) {
-        vrfPos += 4; // skip "vrf-"
-        size_t vrfEnd = dlLink.find('/', vrfPos);
-        vrfHash = dlLink.substr(vrfPos, vrfEnd == std::string::npos ? 8 : vrfEnd - vrfPos);
-    }
-
-    std::cout << "[Subs] Found: " << subFile << std::endl;
-
-    // Build wyzie.io download URL
-    std::string tmpSrt = "/tmp/imdbsub_" + fileID + ".srt";
-    bool downloaded = false;
-
-    if (!vrfHash.empty()) {
-        std::string wyzieURL = "https://sub.wyzie.io/c/" + vrfHash + "/id/" + fileID +
-                               "?format=srt&encoding=UTF-8";
-        downloaded = downloadWyzie(wyzieURL, tmpSrt);
-        // Validate (wyzie.io may return an error JSON instead of SRT)
-        if (downloaded) {
-            FILE* f = fopen(tmpSrt.c_str(), "r");
-            char buf[16] = {};
-            size_t n = 0;
-            if (f) { n = fread(buf, 1, 15, f); fclose(f); }
-            if (n == 0 || buf[0] == '{' || buf[0] == '[') { // empty or JSON error
-                std::remove(tmpSrt.c_str());
-                downloaded = false;
-            }
-        }
-    }
-
-    // Fallback: download the .gz directly from OpenSubtitles
-    if (!downloaded) {
-        std::string tmpGz = "/tmp/imdbsub_" + fileID + ".gz";
-        if (downloadBinaryFile(dlLink, tmpGz)) {
-            std::string gunzipCmd = "gunzip -c \"" + tmpGz + "\" > \"" + tmpSrt + "\" 2>/dev/null";
-            downloaded = (std::system(gunzipCmd.c_str()) == 0);
-            std::remove(tmpGz.c_str());
-        }
-    }
-
-    if (!downloaded) { std::cerr << "[Subs] Subtitle download failed.\n"; return; }
-
-    std::string dest = outputBase + ".srt";
-    if (std::rename(tmpSrt.c_str(), dest.c_str()) != 0) {
-        std::system(("cp \"" + tmpSrt + "\" \"" + dest + "\"").c_str());
-        std::remove(tmpSrt.c_str());
-    }
-    std::cout << "[Subs] Saved: " << dest << std::endl;
-
-    // Optionally mux into video
-    if (g_embedSubs) {
-        std::string videoPath = outputBase + ".mp4";
-        std::string tmpMux    = outputBase + "_mux.mp4";
-        std::string muxCmd = "ffmpeg -y -i \"" + videoPath + "\" -i \"" + dest + "\""
-                             " -c:v copy -c:a copy -c:s mov_text"
-                             " -metadata:s:s:0 language=" + g_subLang +
-                             " \"" + tmpMux + "\" 2>&1";
-        std::cout << "[Subs] Muxing subtitle into video..." << std::endl;
-        if (std::system(muxCmd.c_str()) == 0) {
-            std::remove(videoPath.c_str());
-            if (std::rename(tmpMux.c_str(), videoPath.c_str()) != 0)
-                std::system(("mv \"" + tmpMux + "\" \"" + videoPath + "\"").c_str());
-            std::remove(dest.c_str());
-            std::cout << "[Subs] Embedded into: " << videoPath << std::endl;
-        } else {
-            std::cerr << "[Subs] ffmpeg mux failed; keeping standalone .srt\n";
-            std::remove(tmpMux.c_str());
-        }
-    }
-}
-
-std::string sanitizeFilename(std::string name) {
-    std::replace(name.begin(), name.end(), ' ', '_');
-    name.erase(std::remove_if(name.begin(), name.end(), [](char c) {
-        return !(std::isalnum(c) || c == '_' || c == '-');
-    }), name.end());
-    return name;
-}
-
-void downloadStream(const std::string& m3u8_url, const std::string& output_path) {
-    std::string cmd = "yt-dlp --user-agent \"Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:152.0) Gecko/20100101 Firefox/152.0\" "
-                      "--referer \"https://brightpathsignals.com/\" "
-                      "--downloader ffmpeg "
-                      "\"" + m3u8_url + "\" -o \"" + output_path + "\"";
-
-    std::cout << "\nExecuting: " << cmd << std::endl;
-    std::system(cmd.c_str());
-}
-
-void handleMovie(const std::string& imdb_id, const std::string& title, const json& stream_urls) {
-    if (stream_urls.empty()) {
+void handleMovie(const std::string& imdbId, const std::string& title) {
+    json movieData;
+    try {
+        movieData = fetchAniApi("/download/movie/" + imdbId);
+    } catch (...) {
         std::cerr << "No streams found for this movie." << std::endl;
         return;
     }
+
+    std::string streamUrl = movieData.value("streamUrl", "");
+    json headers = movieData.value("headers", json::object());
+    if (streamUrl.empty()) {
+        std::cerr << "No streams found for this movie." << std::endl;
+        return;
+    }
+
     std::string base = "./" + sanitizeFilename(title);
-    std::string filename = base + ".mp4";
     std::cout << "\nFound Movie: " << title << std::endl;
-    std::cout << "Downloading to " << filename << "..." << std::endl;
-    downloadStream(stream_urls[0].get<std::string>(), filename);
-    downloadSubtitleMovie(imdb_id, base);  // OpenSubtitles + wyzie.io for movies
+    std::cout << "Downloading to " << base << ".mp4..." << std::endl;
+    
+    downloadStream(streamUrl, base + ".mp4", headers, g_config.fragments);
+    std::cout << "\nDownload complete." << std::endl;
 }
 
-void handleShow(const std::string& imdb_id, const std::string& title, const json& eps_data) {
-    std::cout << "\nFound TV Show: " << title << std::endl;
-    std::cout << "Available Seasons:" << std::endl;
-
-    std::vector<std::string> seasons;
-    for (auto& el : eps_data.items()) {
-        seasons.push_back(el.key());
-        std::cout << "  Season " << el.key() << " (" << el.value().size() << " episodes)" << std::endl;
-    }
-
-    std::cout << "\nOptions:\n  1. Download one specific episode\n  2. Download ALL episodes\nChoose an option (1-2): ";
-    int mode;
-    std::cin >> mode;
-
-    std::string cleanTitle = sanitizeFilename(title);
-
-    if (mode == 1) {
-        std::string chosen_season;
-        int chosen_ep;
-        std::cout << "Enter Season Number: ";
-        std::cin >> chosen_season;
-        std::cout << "Enter Episode Number: ";
-        std::cin >> chosen_ep;
-
-        std::string ep_url = "https://streamdata.vaplayer.ru/api.php?imdb=" + imdb_id + "&type=tv&season=" + chosen_season + "&episode=" + std::to_string(chosen_ep);
-        json ep_res = json::parse(stripToJSON(fetchURL(ep_url)));
-        auto urls = ep_res["data"]["stream_urls"];
-
-        if (!urls.empty()) {
-            std::string base = "./" + cleanTitle + "-S" + chosen_season + "-E" + std::to_string(chosen_ep);
-            downloadStream(urls[0].get<std::string>(), base + ".mp4");
-            downloadSubtitle(title, std::stoi(chosen_season), chosen_ep, base);
-        } else {
-            std::cerr << "Failed to find streams for that episode." << std::endl;
+void handleShow(const std::string& imdbId, const std::string& title, const json& epsData) {
+    if (!epsData.is_null() && epsData.is_object() && !epsData.empty()) {
+        std::cout << "\nFound TV Show: " << title << std::endl;
+        std::cout << "Available Seasons:" << std::endl;
+        
+        std::vector<std::string> seasons;
+        for (auto it = epsData.begin(); it != epsData.end(); ++it) {
+            seasons.push_back(it.key());
+            int count = it.value().is_array() ? it.value().size() : it.value().get<int>();
+            std::cout << "  Season " << it.key() << " (" << count << " episodes)" << std::endl;
         }
 
-    } else if (mode == 2) {
-        std::cout << "\nStarting bulk download queue..." << std::endl;
-        for (const auto& season_num : seasons) {
-            int ep_count = eps_data[season_num].size();
-            for (int ep = 1; ep <= ep_count; ++ep) {
-                std::cout << "\n--- Fetching S" << season_num << "E" << ep << " ---" << std::endl;
-                std::string ep_url = "https://streamdata.vaplayer.ru/api.php?imdb=" + imdb_id + "&type=tv&season=" + season_num + "&episode=" + std::to_string(ep);
+        std::cout << "\nOptions:\n  1. Download one specific episode\n  2. Download ALL episodes" << std::endl;
+        std::cout << "Choose an option (1-2): ";
+        int mode;
+        if (!(std::cin >> mode)) return;
+        std::string cleanTitle = sanitizeFilename(title);
 
-                try {
-                    json ep_res = json::parse(stripToJSON(fetchURL(ep_url)));
-                    auto urls = ep_res["data"]["stream_urls"];
-                    if (!urls.empty()) {
-                        std::string dir_cmd = "mkdir -p \"./" + cleanTitle + "/Season_" + season_num + "\"";
-                        std::system(dir_cmd.c_str());
+        if (mode == 1) {
+            std::string chosenSeason;
+            int chosenEp;
+            std::cout << "Enter Season Number: ";
+            std::cin >> chosenSeason;
+            std::cout << "Enter Episode Number: ";
+            std::cin >> chosenEp;
 
-                        std::string base = "./" + cleanTitle + "/Season_" + season_num + "/" + cleanTitle + "-S" + season_num + "-E" + std::to_string(ep);
-                        downloadStream(urls[0].get<std::string>(), base + ".mp4");
-                        downloadSubtitle(title, std::stoi(season_num), ep, base);
-                    }
-                } catch (...) {
-                    std::cerr << "Skipping S" << season_num << "E" << ep << " due to API parsing error." << std::endl;
+            try {
+                json epRes = fetchAniApi("/download/show/" + imdbId + "/" + chosenSeason + "/" + std::to_string(chosenEp));
+                std::string streamUrl = epRes.value("streamUrl", "");
+                json headers = epRes.value("headers", json::object());
+                if (!streamUrl.empty()) {
+                    std::string base = "./" + cleanTitle + "-S" + chosenSeason + "-E" + std::to_string(chosenEp);
+                    std::cout << "\nDownloading S" << chosenSeason << "E" << chosenEp << "..." << std::endl;
+                    downloadStream(streamUrl, base + ".mp4", headers, g_config.fragments);
+                    std::cout << "\nDownload complete." << std::endl;
+                } else {
+                    std::cerr << "No stream found via primary source." << std::endl;
+                }
+            } catch (...) {
+                std::cerr << "Primary source failed for that episode." << std::endl;
+            }
+        } else if (mode == 2) {
+            DownloadManager manager(g_config.threads);
+            for (const auto& s : seasons) {
+                int epCount = epsData[s].is_array() ? epsData[s].size() : epsData[s].get<int>();
+                for (int ep = 1; ep <= epCount; ++ep) {
+                    Task t;
+                    t.season = s;
+                    t.episode = ep;
+                    t.baseDir = "./" + cleanTitle + "/Season_" + s;
+                    t.fileNameBase = t.baseDir + "/" + cleanTitle + "-S" + s + "-E" + std::to_string(ep);
+                    t.imdbId = imdbId;
+                    manager.addTask(t);
                 }
             }
+
+            std::cout << "\nStarting bulk download (" << manager.tasks.size() << " episodes) with " << g_config.threads << " threads..." << std::endl;
+            manager.startBulk();
+
+            std::vector<std::thread> workers;
+            for (int i = 0; i < g_config.threads; ++i) {
+                workers.emplace_back(downloadWorker, i + 1, &manager);
+            }
+            for (auto& w : workers) w.join();
+            std::cout << "\nAll downloads completed." << std::endl;
+        } else {
+            std::cerr << "Invalid option." << std::endl;
         }
+        return;
     }
+
+    std::cout << "\nFound TV Show: " << title << std::endl;
+    std::cout << "[Info] AniAPI did not return episode metadata. Downloading a single episode only." << std::endl;
+    std::string cleanTitle = sanitizeFilename(title);
+    std::string chosenSeason;
+    int chosenEp;
+    std::cout << "Enter Season Number: ";
+    std::cin >> chosenSeason;
+    std::cout << "Enter Episode Number: ";
+    std::cin >> chosenEp;
+
+    try {
+        json epRes = fetchAniApi("/download/show/" + imdbId + "/" + chosenSeason + "/" + std::to_string(chosenEp));
+        std::string streamUrl = epRes.value("streamUrl", "");
+        json headers = epRes.value("headers", json::object());
+        if (streamUrl.empty()) {
+            std::cerr << "No stream found for that episode." << std::endl;
+            return;
+        }
+        std::string base = "./" + cleanTitle + "-S" + chosenSeason + "-E" + std::to_string(chosenEp);
+        std::cout << "\nDownloading S" << chosenSeason << "E" << chosenEp << "..." << std::endl;
+        downloadStream(streamUrl, base + ".mp4", headers, g_config.fragments);
+        std::cout << "\nDownload complete." << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "AniAPI episode download failed: " << e.what() << std::endl;
+    }
+}
+
+// ── Dependency check ──────────────────────────────────────────────────────────
+
+bool checkDependencies() {
+    int res = std::system("command -v yt-dlp > /dev/null 2>&1");
+    if (res != 0) {
+        std::cerr << "Missing required dependencies:\n";
+#ifdef __APPLE__
+        std::cerr << "  yt-dlp  →  brew install yt-dlp\n";
+#else
+        std::cerr << "  yt-dlp  →  sudo apt install yt-dlp\n";
+#endif
+        return false;
+    }
+    return true;
+}
+
+// ── Main ──────────────────────────────────────────────────────────────────────
+
+void printHelp() {
+    std::cout << "Usage: imdbdownloader <imdb_id> [options]\n"
+              << "Options:\n"
+              << "  --key <apikey>                   AniAPI key (falls back to ANIAPI_TOKEN env var)\n"
+              << "  -t, --threads <number>           Number of concurrent downloads (shows only) [default: 3]\n"
+              << "  --concurrent-fragments <number>  Number of concurrent fragments per download [default: 8]\n\n"
+              << "Examples:\n"
+              << "  $ imdbdownloader tt0480489\n"
+              << "  $ imdbdownloader tt0480489 --key YOUR_API_KEY\n"
+              << "  $ imdbdownloader tt0480489 --threads 5\n"
+              << "  $ ANIAPI_TOKEN=YOUR_API_KEY imdbdownloader tt0480489\n";
 }
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <IMDB_ID> [--no-subs] [--lang <Language>]\n"
-                  << "  e.g.: " << argv[0] << " tt0480489\n"
-                  << "        " << argv[0] << " tt0480489 --lang English\n"
-                  << "        " << argv[0] << " tt0480489 --no-subs\n";
+        printHelp();
         return 1;
     }
 
-    std::string imdb_id = argv[1];
-
-    if (imdb_id == "--help" || imdb_id == "-h") {
-        std::cout << "Usage: " << argv[0] << " <IMDB_ID> [--no-subs] [--embed-subs] [--lang <Language>]\n"
-                  << "  e.g.: " << argv[0] << " tt0480489\n"
-                  << "        " << argv[0] << " tt0480489 --embed-subs\n"
-                  << "        " << argv[0] << " tt0480489 --lang English\n"
-                  << "        " << argv[0] << " tt0480489 --no-subs\n"
-                  << "\n  --embed-subs  Mux subtitle track into the .mp4 using ffmpeg (removes .srt)\n"
-                  << "  --no-subs     Skip subtitle download entirely\n"
-                  << "  --lang <L>    Subtitle language (default: English)\n";
+    std::string imdbId = argv[1];
+    if (imdbId == "--help" || imdbId == "-h") {
+        printHelp();
         return 0;
     }
 
+    const char* envToken = std::getenv("ANIAPI_TOKEN");
+    if (envToken) g_config.apiKey = trim(envToken);
+
     for (int i = 2; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "--no-subs") {
-            g_noSubs = true;
-        } else if (arg == "--embed-subs") {
-            g_embedSubs = true;
-        } else if (arg == "--lang" && i + 1 < argc) {
-            g_subLang = argv[++i];
+        if (arg == "--key" && i + 1 < argc) {
+            g_config.apiKey = trim(argv[++i]);
+        } else if ((arg == "-t" || arg == "--threads") && i + 1 < argc) {
+            g_config.threads = std::stoi(argv[++i]);
+        } else if (arg == "--concurrent-fragments" && i + 1 < argc) {
+            g_config.fragments = std::stoi(argv[++i]);
         }
     }
 
-    // ── Dependency check ─────────────────────────────────────────────────────
-    {
-        // Detect platform for install hints
-        bool isMac = false;
-        {
-            FILE* p = popen("uname -s 2>/dev/null", "r");
-            if (p) {
-                char buf[16] = {};
-                if (fgets(buf, sizeof(buf), p)) isMac = (std::string(buf).find("Darwin") != std::string::npos);
-                pclose(p);
-            }
-        }
-
-        struct Tool { const char* cmd; const char* brew; const char* apt; };
-        const Tool tools[] = {
-            { "unar",   "unar",   "unar"   },
-            { "yt-dlp", "yt-dlp", "yt-dlp" },
-            { "ffmpeg", "ffmpeg", "ffmpeg"  },
-        };
-
-        bool missing = false;
-        for (auto& t : tools) {
-            std::string check = std::string("command -v ") + t.cmd + " >/dev/null 2>&1";
-            if (std::system(check.c_str()) != 0) {
-                if (!missing) {
-                    std::cerr << "Missing required dependencies:\n";
-                    missing = true;
-                }
-                if (isMac)
-                    std::cerr << "  " << t.cmd << "  →  brew install " << t.brew << "\n";
-                else
-                    std::cerr << "  " << t.cmd << "  →  sudo apt install " << t.apt << "\n";
-            }
-        }
-        if (missing) return 1;
-    }
-
-    std::cout << "Analyzing IMDB Media Signature..." << std::endl;
-    std::string initial_url = "https://streamdata.vaplayer.ru/api.php?imdb=" + imdb_id + "&type=tv";
-    std::string raw_json = fetchURL(initial_url);
-
-    if (raw_json.empty()) {
-        std::cerr << "Failed to retrieve data from api endpoint." << std::endl;
+    if (g_config.apiKey.empty()) {
+        std::cerr << "Error: API key required. Contact @kobosh_com on telegram/@kobosh.com on discord for a api key" << std::endl;
         return 1;
     }
 
-    json res = json::parse(stripToJSON(raw_json));
-    std::string title = res["data"]["title"].get<std::string>();
+    if (!checkDependencies()) return 1;
 
-    if (res["data"]["eps"].is_boolean() && res["data"]["eps"].get<bool>() == false) {
-        std::string movie_url = "https://streamdata.vaplayer.ru/api.php?imdb=" + imdb_id + "&type=movie";
-        json movie_res = json::parse(stripToJSON(fetchURL(movie_url)));
-        handleMovie(imdb_id, title, movie_res["data"]["stream_urls"]);
-    } else {
-        handleShow(imdb_id, title, res["data"]["eps"]);
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+
+    std::cout << "Analyzing IMDB Media Signature..." << std::endl;
+
+    try {
+        Metadata meta = fetchImdbMetadata(imdbId);
+        std::cout << "\nTitle: " << meta.title << " (" << meta.type << ")" << std::endl;
+
+        if (!isShowType(meta.type)) {
+            handleMovie(imdbId, meta.title);
+        } else {
+            handleShow(imdbId, meta.title, meta.episodes);
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
     }
 
+    curl_global_cleanup();
     return 0;
 }
