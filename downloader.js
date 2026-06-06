@@ -244,6 +244,11 @@ async function downloadStream(m3u8Url, outputPath, extraHeaders = {}, onProgress
     args.unshift('--referer');
   }
 
+  for (const [key, value] of Object.entries(extraHeaders)) {
+    if (key === 'User-Agent' || key === 'Referer') continue;
+    args.push('--add-header', `${key}:${value}`);
+  }
+
   return new Promise((resolve, reject) => {
     const child = spawn('yt-dlp', args);
     let linesInitialized = false;

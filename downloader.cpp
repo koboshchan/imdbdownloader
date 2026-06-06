@@ -345,6 +345,12 @@ void downloadStream(const std::string& m3u8Url, const std::string& outputPath, c
         cmd += "--referer \"" + extraHeaders["Referer"].get<std::string>() + "\" ";
     }
     
+    for (auto it = extraHeaders.begin(); it != extraHeaders.end(); ++it) {
+        std::string key = it.key();
+        if (key == "User-Agent" || key == "Referer") continue;
+        cmd += "--add-header \"" + key + ":" + it.value().get<std::string>() + "\" ";
+    }
+    
     cmd += "\"" + m3u8Url + "\" -o \"" + outputPath + "\" 2>&1";
 
     FILE* pipe = popen(cmd.c_str(), "r");
