@@ -233,6 +233,7 @@ async function downloadStream(m3u8Url, outputPath, extraHeaders = {}, onProgress
   const args = [
     '--user-agent', userAgent,
     '--concurrent-fragments', String(fragments),
+    '--extractor-args', 'generic:impersonate',
     '--newline',
     m3u8Url,
     '-o', outputPath,
