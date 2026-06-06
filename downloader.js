@@ -15,6 +15,8 @@ const config = {
   threads: 3,
   fragments: 8,
   apiKey: '',
+  embedSubs: false,
+  subLang: 'English',
 };
 
 const ANIAPI_BASE   = 'https://aniapi.kobosh.com';
@@ -162,6 +164,67 @@ function sanitizeFilename(name) {
   return name.replace(/ /g, '_').replace(/[^a-zA-Z0-9_\-]/g, '');
 }
 
+// ── Subtitle management ──────────────────────────────────────────────────────
+
+async function handleSubtitles(imdbId, season, episode, videoPath) {
+  if (!config.embedSubs) return;
+
+  try {
+    const path = season 
+      ? `/subtitles/show/${imdbId}/${season}/${episode}`
+      : `/subtitles/movie/${imdbId}`;
+    
+    console.log(`[Subs] Fetching subtitles from ${path}...`);
+    const subs = await fetchAniApi(path);
+    if (!subs || subs.length === 0) {
+      console.log('[Subs] No subtitles found.');
+      return;
+    }
+
+    // Try to find preferred language, fallback to first
+    const sub = subs.find(s => s.language.toLowerCase() === config.subLang.toLowerCase()) || subs[0];
+    console.log(`[Subs] Downloading ${sub.language} (${sub.format}) subtitle...`);
+
+    const subUrl = sub.url.startsWith('http') ? sub.url : `${ANIAPI_BASE}${sub.url}`;
+    const subResponse = await axios.get(subUrl, { 
+      headers: { 'x-api-key': config.apiKey },
+      responseType: 'arraybuffer' 
+    });
+
+    const srtPath = videoPath.replace(/\.mp4$/, '.srt');
+    fs.writeFileSync(srtPath, subResponse.data);
+
+    console.log(`[Subs] Embedding subtitle into ${videoPath}...`);
+    const tempVideoPath = videoPath.replace(/\.mp4$/, '.temp.mp4');
+    
+    // Mux with ffmpeg: copy video/audio, add subtitle as mov_text
+    const ffmpegArgs = [
+      '-y',
+      '-i', videoPath,
+      '-i', srtPath,
+      '-c', 'copy',
+      '-c:s', 'mov_text',
+      '-metadata:s:s:0', `language=${sub.language.slice(0, 3).toLowerCase()}`,
+      tempVideoPath
+    ];
+
+    await new Promise((resolve, reject) => {
+      const child = spawn('ffmpeg', ffmpegArgs);
+      child.on('close', (code) => {
+        if (code === 0) resolve();
+        else reject(new Error(`ffmpeg failed with code ${code}`));
+      });
+    });
+
+    // Replace original with muxed version and cleanup
+    fs.renameSync(tempVideoPath, videoPath);
+    fs.unlinkSync(srtPath);
+    console.log('[Subs] Subtitle embedded successfully.');
+  } catch (err) {
+    console.error(`[Subs] Failed to embed subtitles: ${err.message}`);
+  }
+}
+
 // ── Video downloader ──────────────────────────────────────────────────────────
 
 async function downloadStream(m3u8Url, outputPath, extraHeaders = {}, onProgress = null, fragments = 8, onOutput = null) {
@@ -231,7 +294,7 @@ async function downloadWorker(workerId, manager, streamSourceFn) {
     });
 
     try {
-      const { season, episode, baseDir, fileNameBase, extraHeaders } = task;
+      const { season, episode, baseDir, fileNameBase, extraHeaders, imdbId } = task;
       const m3u8 = await streamSourceFn(task);
       if (!m3u8) throw new Error('No stream URL');
 
@@ -243,6 +306,8 @@ async function downloadWorker(workerId, manager, streamSourceFn) {
       }, config.fragments, (line) => {
         manager.updateWorker(workerId, { lastOutput: line });
       });
+
+      await handleSubtitles(imdbId, season, episode, outputPath);
 
       task.downloaded = true;
       manager.updateWorker(workerId, { status: 'Done', progress: 100 });
@@ -276,7 +341,9 @@ async function handleMovie(imdbId, title) {
   console.log(`\nFound Movie: ${title}`);
   console.log(`Downloading to ${base}.mp4...`);
   
-  await downloadStream(streamUrl, `${base}.mp4`, headers, null, config.fragments);
+  const outputPath = `${base}.mp4`;
+  await downloadStream(streamUrl, outputPath, headers, null, config.fragments);
+  await handleSubtitles(imdbId, null, null, outputPath);
   console.log('\nDownload complete.');
 }
 
@@ -310,8 +377,10 @@ async function handleShow(imdbId, title, _originalTitle, epsData) {
         const headers = epRes?.headers || {};
         if (streamUrl) {
           const base = `./${cleanTitle}-S${chosenSeason}-E${chosenEp}`;
+          const outputPath = `${base}.mp4`;
           console.log(`\nDownloading S${chosenSeason}E${chosenEp}...`);
-          await downloadStream(streamUrl, `${base}.mp4`, headers, null, config.fragments);
+          await downloadStream(streamUrl, outputPath, headers, null, config.fragments);
+          await handleSubtitles(imdbId, chosenSeason, chosenEp, outputPath);
           console.log('\nDownload complete.');
         } else {
           console.error('No stream found via primary source.');
@@ -374,8 +443,10 @@ async function handleShow(imdbId, title, _originalTitle, epsData) {
       return;
     }
     const base = `./${cleanTitle}-S${chosenSeason}-E${chosenEp}`;
+    const outputPath = `${base}.mp4`;
     console.log(`\nDownloading S${chosenSeason}E${chosenEp}...`);
-    await downloadStream(streamUrl, `${base}.mp4`, headers, null, config.fragments);
+    await downloadStream(streamUrl, outputPath, headers, null, config.fragments);
+    await handleSubtitles(imdbId, chosenSeason, chosenEp, outputPath);
     console.log('\nDownload complete.');
   } catch (err) {
     console.error('AniAPI episode download failed:', err.message);
@@ -388,6 +459,7 @@ function checkDependencies() {
   const isMac = os.platform() === 'darwin';
   const tools = [
     { cmd: 'yt-dlp', brew: 'yt-dlp', apt: 'yt-dlp' },
+    { cmd: 'ffmpeg', brew: 'ffmpeg', apt: 'ffmpeg' },
   ];
 
   let missing = false;
@@ -413,10 +485,12 @@ async function main() {
     .option('--key <apikey>', 'AniAPI key (falls back to ANIAPI_TOKEN env var)')
     .option('-t, --threads <number>', 'Number of concurrent downloads (shows only)', '3')
     .option('--concurrent-fragments <number>', 'Number of concurrent fragments per download', '8')
+    .option('--embed-subs', 'Automatically download and embed subtitles', false)
+    .option('--sub-lang <lang>', 'Preferred subtitle language', 'English')
     .addHelpText('after', `
 Examples:
-  $ imdbdownloader tt0480489
-  $ node downloader.js tt0480489 --key YOUR_API_KEY
+  $ imdbdownloader tt0480489 --embed-subs
+  $ node downloader.js tt0480489 --key YOUR_API_KEY --embed-subs --sub-lang Hungarian
   $ node downloader.js tt0480489 --threads 5
   $ ANIAPI_TOKEN=YOUR_API_KEY node downloader.js tt0480489
 
@@ -430,6 +504,8 @@ Note: when using "npm start", pass flags after "--":
   config.threads   = parseInt(opts.threads) || 3;
   config.fragments = parseInt(opts.concurrentFragments) || 8;
   config.apiKey    = (opts.key || process.env.ANIAPI_TOKEN || '').toString().trim().replace(/['"]/g, '');
+  config.embedSubs = !!opts.embedSubs;
+  config.subLang   = opts.subLang || 'English';
 
   if (!config.apiKey) {
     console.error('Error: API key required. Contact @kobosh_com on telegram/@kobosh.com on discord for a api key');

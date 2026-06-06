@@ -12,6 +12,7 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 #include <regex>
+#include <fstream>
 
 using json = nlohmann::json;
 namespace fs = std::filesystem;
@@ -22,6 +23,8 @@ struct Config {
     int threads = 3;
     int fragments = 8;
     std::string apiKey;
+    bool embedSubs = false;
+    std::string subLang = "English";
 } g_config;
 
 const std::string ANIAPI_BASE = "https://aniapi.kobosh.com";
@@ -254,6 +257,80 @@ bool isShowType(const std::string& type) {
     return std::regex_search(type, re);
 }
 
+// ── Subtitle management ──────────────────────────────────────────────────────
+
+void handleSubtitles(const std::string& imdbId, const std::string& season, int episode, const std::string& videoPath) {
+    if (!g_config.embedSubs) return;
+
+    try {
+        std::string path = (episode > 0)
+            ? "/subtitles/show/" + imdbId + "/" + season + "/" + std::to_string(episode)
+            : "/subtitles/movie/" + imdbId;
+
+        std::cout << "[Subs] Fetching subtitles from " << path << "..." << std::endl;
+        json subs = fetchAniApi(path);
+        
+        if (subs.empty()) {
+            std::cout << "[Subs] No subtitles found." << std::endl;
+            return;
+        }
+
+        // Try to find preferred language, fallback to first
+        json selectedSub = subs[0];
+        for (const auto& s : subs) {
+            std::string lang = s.value("language", "");
+            std::transform(lang.begin(), lang.end(), lang.begin(), ::tolower);
+            std::string pref = g_config.subLang;
+            std::transform(pref.begin(), pref.end(), pref.begin(), ::tolower);
+            if (lang == pref) {
+                selectedSub = s;
+                break;
+            }
+        }
+
+        std::string subUrl = selectedSub.value("url", "");
+        if (subUrl.find("http") != 0) {
+            subUrl = ANIAPI_BASE + subUrl;
+        }
+
+        std::cout << "[Subs] Downloading " << selectedSub.value("language", "Unknown") << " subtitle..." << std::endl;
+        std::string subData = fetchURL(subUrl, g_config.apiKey);
+        
+        std::string srtPath = videoPath;
+        size_t dot = srtPath.find_last_of(".");
+        if (dot != std::string::npos) srtPath = srtPath.substr(0, dot) + ".srt";
+        else srtPath += ".srt";
+
+        std::ofstream out(srtPath);
+        out << subData;
+        out.close();
+
+        std::cout << "[Subs] Embedding subtitle into " << videoPath << "..." << std::endl;
+        std::string tempVideoPath = videoPath;
+        dot = tempVideoPath.find_last_of(".");
+        if (dot != std::string::npos) tempVideoPath = tempVideoPath.substr(0, dot) + ".temp.mp4";
+        else tempVideoPath += ".temp.mp4";
+
+        std::string lang = selectedSub.value("language", "eng");
+        if (lang.length() > 3) lang = lang.substr(0, 3);
+        std::transform(lang.begin(), lang.end(), lang.begin(), ::tolower);
+
+        std::string cmd = "ffmpeg -y -i \"" + videoPath + "\" -i \"" + srtPath + "\" -c copy -c:s mov_text -metadata:s:s:0 language=" + lang + " \"" + tempVideoPath + "\" > /dev/null 2>&1";
+        
+        int res = std::system(cmd.c_str());
+        if (res == 0) {
+            fs::rename(tempVideoPath, videoPath);
+            fs::remove(srtPath);
+            std::cout << "[Subs] Subtitle embedded successfully." << std::endl;
+        } else {
+            std::cerr << "[Subs] ffmpeg failed with code " << res << std::endl;
+            if (fs::exists(tempVideoPath)) fs::remove(tempVideoPath);
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "[Subs] Failed to embed subtitles: " << e.what() << std::endl;
+    }
+}
+
 // ── Video downloader ──────────────────────────────────────────────────────────
 
 void downloadStream(const std::string& m3u8Url, const std::string& outputPath, const json& extraHeaders, 
@@ -319,6 +396,8 @@ void downloadWorker(int workerId, DownloadManager* manager) {
 
             downloadStream(m3u8, outputPath, headers, g_config.fragments, workerId, manager);
 
+            handleSubtitles(task->imdbId, task->season, task->episode, outputPath);
+
             task->downloaded = true;
             manager->updateWorker(workerId, "Done", 100, task);
         } catch (const std::exception& e) {
@@ -349,9 +428,11 @@ void handleMovie(const std::string& imdbId, const std::string& title) {
 
     std::string base = "./" + sanitizeFilename(title);
     std::cout << "\nFound Movie: " << title << std::endl;
-    std::cout << "Downloading to " << base << ".mp4..." << std::endl;
+    std::string outputPath = base + ".mp4";
+    std::cout << "Downloading to " << outputPath << "..." << std::endl;
     
-    downloadStream(streamUrl, base + ".mp4", headers, g_config.fragments);
+    downloadStream(streamUrl, outputPath, headers, g_config.fragments);
+    handleSubtitles(imdbId, "", 0, outputPath);
     std::cout << "\nDownload complete." << std::endl;
 }
 
@@ -387,8 +468,10 @@ void handleShow(const std::string& imdbId, const std::string& title, const json&
                 json headers = epRes.value("headers", json::object());
                 if (!streamUrl.empty()) {
                     std::string base = "./" + cleanTitle + "-S" + chosenSeason + "-E" + std::to_string(chosenEp);
+                    std::string outputPath = base + ".mp4";
                     std::cout << "\nDownloading S" << chosenSeason << "E" << chosenEp << "..." << std::endl;
-                    downloadStream(streamUrl, base + ".mp4", headers, g_config.fragments);
+                    downloadStream(streamUrl, outputPath, headers, g_config.fragments);
+                    handleSubtitles(imdbId, chosenSeason, chosenEp, outputPath);
                     std::cout << "\nDownload complete." << std::endl;
                 } else {
                     std::cerr << "No stream found via primary source." << std::endl;
@@ -445,8 +528,10 @@ void handleShow(const std::string& imdbId, const std::string& title, const json&
             return;
         }
         std::string base = "./" + cleanTitle + "-S" + chosenSeason + "-E" + std::to_string(chosenEp);
+        std::string outputPath = base + ".mp4";
         std::cout << "\nDownloading S" << chosenSeason << "E" << chosenEp << "..." << std::endl;
-        downloadStream(streamUrl, base + ".mp4", headers, g_config.fragments);
+        downloadStream(streamUrl, outputPath, headers, g_config.fragments);
+        handleSubtitles(imdbId, chosenSeason, chosenEp, outputPath);
         std::cout << "\nDownload complete." << std::endl;
     } catch (const std::exception& e) {
         std::cerr << "AniAPI episode download failed: " << e.what() << std::endl;
@@ -458,12 +543,12 @@ void handleShow(const std::string& imdbId, const std::string& title, const json&
 bool checkDependencies() {
     int res = std::system("command -v yt-dlp > /dev/null 2>&1");
     if (res != 0) {
-        std::cerr << "Missing required dependencies:\n";
-#ifdef __APPLE__
-        std::cerr << "  yt-dlp  →  brew install yt-dlp\n";
-#else
-        std::cerr << "  yt-dlp  →  sudo apt install yt-dlp\n";
-#endif
+        std::cerr << "Missing required dependencies: yt-dlp\n";
+        return false;
+    }
+    res = std::system("command -v ffmpeg > /dev/null 2>&1");
+    if (res != 0) {
+        std::cerr << "Missing required dependencies: ffmpeg\n";
         return false;
     }
     return true;
@@ -476,12 +561,12 @@ void printHelp() {
               << "Options:\n"
               << "  --key <apikey>                   AniAPI key (falls back to ANIAPI_TOKEN env var)\n"
               << "  -t, --threads <number>           Number of concurrent downloads (shows only) [default: 3]\n"
-              << "  --concurrent-fragments <number>  Number of concurrent fragments per download [default: 8]\n\n"
+              << "  --concurrent-fragments <number>  Number of concurrent fragments per download [default: 8]\n"
+              << "  --embed-subs                     Automatically download and embed subtitles\n"
+              << "  --sub-lang <lang>                Preferred subtitle language [default: English]\n\n"
               << "Examples:\n"
-              << "  $ imdbdownloader tt0480489\n"
-              << "  $ imdbdownloader tt0480489 --key YOUR_API_KEY\n"
-              << "  $ imdbdownloader tt0480489 --threads 5\n"
-              << "  $ ANIAPI_TOKEN=YOUR_API_KEY imdbdownloader tt0480489\n";
+              << "  $ imdbdownloader tt0480489 --embed-subs\n"
+              << "  $ imdbdownloader tt0480489 --key YOUR_API_KEY --embed-subs --sub-lang Hungarian\n";
 }
 
 int main(int argc, char* argv[]) {
@@ -507,6 +592,10 @@ int main(int argc, char* argv[]) {
             g_config.threads = std::stoi(argv[++i]);
         } else if (arg == "--concurrent-fragments" && i + 1 < argc) {
             g_config.fragments = std::stoi(argv[++i]);
+        } else if (arg == "--embed-subs") {
+            g_config.embedSubs = true;
+        } else if (arg == "--sub-lang" && i + 1 < argc) {
+            g_config.subLang = argv[++i];
         }
     }
 
