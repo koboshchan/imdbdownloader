@@ -257,41 +257,56 @@ async function downloadStream(m3u8Url, outputPath, extraHeaders = {}, onProgress
     args.push('--add-header', `${key}:${value}`);
   }
 
-  return new Promise((resolve, reject) => {
-    const child = spawn('yt-dlp', args);
-    let linesInitialized = false;
+  const maxRetries = 3;
+  let retries = 0;
 
-    child.stdout.on('data', (data) => {
-      const text = data.toString();
-      const lines = text.split('\n').filter(l => l.trim());
-      if (lines.length === 0) return;
-      const lastLine = lines[lines.length - 1];
+  while (retries <= maxRetries) {
+    try {
+      await new Promise((resolve, reject) => {
+        const child = spawn('yt-dlp', args);
+        let linesInitialized = false;
 
-      if (onOutput) {
-        onOutput(lastLine);
-      } else {
-        if (!linesInitialized) {
-          process.stdout.write('\n');
-          linesInitialized = true;
-        }
-        readline.moveCursor(process.stdout, 0, -1);
-        process.stdout.write(`\r\x1b[KStatus: Downloading...\n\x1b[K${lastLine.slice(0, (process.stdout.columns || 80) - 1)}`);
-      }
+        child.stdout.on('data', (data) => {
+          const text = data.toString();
+          const lines = text.split('\n').filter(l => l.trim());
+          if (lines.length === 0) return;
+          const lastLine = lines[lines.length - 1];
 
-      if (onProgress) {
-        const match = /\[download\]\s+(\d+\.\d+)%/.exec(lastLine);
-        if (match) {
-          onProgress(parseFloat(match[1]));
-        }
-      }
-    });
+          if (onOutput) {
+            onOutput(lastLine);
+          } else {
+            if (!linesInitialized) {
+              process.stdout.write('\n');
+              linesInitialized = true;
+            }
+            readline.moveCursor(process.stdout, 0, -1);
+            process.stdout.write(`\r\x1b[KStatus: Downloading...\n\x1b[K${lastLine.slice(0, (process.stdout.columns || 80) - 1)}`);
+          }
 
-    child.on('close', (code) => {
-      if (!onOutput && linesInitialized) process.stdout.write('\n');
-      if (code === 0) resolve();
-      else reject(new Error(`yt-dlp failed with code ${code}`));
-    });
-  });
+          if (onProgress) {
+            const match = /\[download\]\s+(\d+\.\d+)%/.exec(lastLine);
+            if (match) {
+              onProgress(parseFloat(match[1]));
+            }
+          }
+        });
+
+        child.on('close', (code) => {
+          if (!onOutput && linesInitialized) process.stdout.write('\n');
+          if (code === 0) resolve();
+          else reject(new Error(`yt-dlp failed with code ${code}`));
+        });
+      });
+      return; // Success, exit the retry loop
+    } catch (err) {
+      retries++;
+      if (retries > maxRetries) throw err;
+      const retryMsg = `yt-dlp failed, retrying in 5s (${retries}/${maxRetries})...`;
+      if (onOutput) onOutput(retryMsg);
+      else console.log(`\n${retryMsg}`);
+      await new Promise(r => setTimeout(r, 5000));
+    }
+  }
 }
 
 // ── Content handlers ──────────────────────────────────────────────────────────
@@ -432,7 +447,13 @@ async function handleShow(imdbId, title, _originalTitle, epsData) {
         downloadWorker(i + 1, manager, sourceFn)
       );
       await Promise.all(workers);
-      console.log('\nAll downloads completed.');
+      
+      const failedCount = manager.tasks.filter(t => t.failed).length;
+      if (failedCount > 0) {
+        console.log(`\nNot all eps are downloaded and they need to run the command again`);
+      } else {
+        console.log('\nAll downloads completed.');
+      }
     } else {
       rl.close();
       console.error('Invalid option.');

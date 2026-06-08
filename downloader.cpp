@@ -3,6 +3,7 @@
 #include <vector>
 #include <mutex>
 #include <thread>
+#include <chrono>
 #include <atomic>
 #include <sstream>
 #include <iomanip>
@@ -361,32 +362,48 @@ void downloadStream(const std::string& m3u8Url, const std::string& outputPath, c
     
     cmd += "\"" + m3u8Url + "\" -o \"" + outputPath + "\" 2>&1";
 
-    FILE* pipe = popen(cmd.c_str(), "r");
-    if (!pipe) throw std::runtime_error("Failed to run yt-dlp");
+    int maxRetries = 3;
+    int retries = 0;
 
-    char buffer[1024];
-    std::regex progressRe("\\[download\\]\\s+([0-9]+\\.[0-9]+)%");
-    
-    while (fgets(buffer, sizeof(buffer), pipe) != NULL) {
-        std::string line(buffer);
-        if (line.back() == '\n') line.pop_back();
-        if (line.empty()) continue;
+    while (retries <= maxRetries) {
+        FILE* pipe = popen(cmd.c_str(), "r");
+        if (!pipe) throw std::runtime_error("Failed to run yt-dlp");
 
-        double progress = 0;
-        std::smatch match;
-        if (std::regex_search(line, match, progressRe)) {
-            progress = std::stod(match[1].str());
+        char buffer[1024];
+        std::regex progressRe("\\[download\\]\\s+([0-9]+\\.[0-9]+)%");
+        
+        while (fgets(buffer, sizeof(buffer), pipe) != NULL) {
+            std::string line(buffer);
+            if (line.back() == '\n') line.pop_back();
+            if (line.empty()) continue;
+
+            double progress = 0;
+            std::smatch match;
+            if (std::regex_search(line, match, progressRe)) {
+                progress = std::stod(match[1].str());
+            }
+
+            if (manager) {
+                manager->updateWorker(workerId, "Downloading", progress, nullptr, line);
+            } else {
+                std::cout << "\r\x1b[KStatus: Downloading... " << line << std::flush;
+            }
         }
 
+        int result = pclose(pipe);
+        if (result == 0) return;
+
+        retries++;
+        if (retries > maxRetries) throw std::runtime_error("yt-dlp failed with code " + std::to_string(result));
+
+        std::string msg = "yt-dlp failed, retrying in 5s (" + std::to_string(retries) + "/" + std::to_string(maxRetries) + ")...";
         if (manager) {
-            manager->updateWorker(workerId, "Downloading", progress, nullptr, line);
+            manager->updateWorker(workerId, "Retrying", 0, nullptr, msg);
         } else {
-            std::cout << "\r\x1b[KStatus: Downloading... " << line << std::flush;
+            std::cout << "\n" << msg << std::endl;
         }
+        std::this_thread::sleep_for(std::chrono::seconds(5));
     }
-
-    int result = pclose(pipe);
-    if (result != 0) throw std::runtime_error("yt-dlp failed with code " + std::to_string(result));
 }
 
 // ── Content handlers ──────────────────────────────────────────────────────────
@@ -516,7 +533,14 @@ void handleShow(const std::string& imdbId, const std::string& title, const json&
                 workers.emplace_back(downloadWorker, i + 1, &manager);
             }
             for (auto& w : workers) w.join();
-            std::cout << "\nAll downloads completed." << std::endl;
+            
+            int failedCount = 0;
+            for (const auto& t : manager.tasks) if (t.failed) failedCount++;
+            if (failedCount > 0) {
+                std::cout << "\nNot all eps are downloaded and they need to run the command again" << std::endl;
+            } else {
+                std::cout << "\nAll downloads completed." << std::endl;
+            }
         } else {
             std::cerr << "Invalid option." << std::endl;
         }
