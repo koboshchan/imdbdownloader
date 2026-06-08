@@ -189,8 +189,9 @@ async function handleSubtitles(imdbId, season, episode, videoPath, workerId = 0,
       return;
     }
 
-    // Try to find preferred language, fallback to first
-    const sub = subs.find(s => s.language.toLowerCase() === config.subLang.toLowerCase()) || subs[0];
+    // New API returns all candidates sorted by rating; prefer configured language then top item.
+    const prefLang = (config.subLang || '').toLowerCase();
+    const sub = subs.find(s => (s.language || '').toLowerCase() === prefLang) || subs[0];
     log(`[Subs] Downloading ${sub.language} subtitle...`);
 
     const subUrl = sub.url.startsWith('http') ? sub.url : `${ANIAPI_BASE}${sub.url}`;
@@ -199,8 +200,13 @@ async function handleSubtitles(imdbId, season, episode, videoPath, workerId = 0,
       responseType: 'arraybuffer' 
     });
 
-    const srtPath = videoPath.replace(/\.mp4$/, '.srt');
-    fs.writeFileSync(srtPath, subResponse.data);
+    const subExt = (() => {
+      if (sub.format && /^[a-z0-9]+$/i.test(sub.format)) return `.${sub.format.toLowerCase()}`;
+      if (sub.filename && sub.filename.includes('.')) return `.${sub.filename.split('.').pop().toLowerCase()}`;
+      return '.srt';
+    })();
+    const subPath = videoPath.replace(/\.mp4$/, subExt);
+    fs.writeFileSync(subPath, Buffer.from(subResponse.data));
 
     log(`[Subs] Embedding subtitle...`);
     const tempVideoPath = videoPath.replace(/\.mp4$/, '.temp.mp4');
@@ -209,7 +215,7 @@ async function handleSubtitles(imdbId, season, episode, videoPath, workerId = 0,
     const ffmpegArgs = [
       '-y',
       '-i', videoPath,
-      '-i', srtPath,
+      '-i', subPath,
       '-c', 'copy',
       '-c:s', 'mov_text',
       '-metadata:s:s:0', `language=${sub.language.slice(0, 3).toLowerCase()}`,
@@ -226,7 +232,7 @@ async function handleSubtitles(imdbId, season, episode, videoPath, workerId = 0,
 
     // Replace original with muxed version and cleanup
     fs.renameSync(tempVideoPath, videoPath);
-    fs.unlinkSync(srtPath);
+    fs.unlinkSync(subPath);
     log('[Subs] Embedded successfully.');
   } catch (err) {
     log(`[Subs] Error: ${err.message}`);

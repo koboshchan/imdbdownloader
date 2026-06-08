@@ -284,7 +284,7 @@ void handleSubtitles(const std::string& imdbId, const std::string& season, int e
             return;
         }
 
-        // Try to find preferred language, fallback to first
+        // New API returns all candidates sorted by rating; prefer configured language then top item.
         json selectedSub = subs[0];
         for (const auto& s : subs) {
             std::string lang = s.value("language", "");
@@ -305,12 +305,27 @@ void handleSubtitles(const std::string& imdbId, const std::string& season, int e
         log("[Subs] Downloading " + selectedSub.value("language", "Unknown") + " subtitle...");
         std::string subData = fetchURL(subUrl, g_config.apiKey);
         
-        std::string srtPath = videoPath;
-        size_t dot = srtPath.find_last_of(".");
-        if (dot != std::string::npos) srtPath = srtPath.substr(0, dot) + ".srt";
-        else srtPath += ".srt";
+        std::string subExt = ".srt";
+        if (selectedSub.contains("format")) {
+            std::string fmt = selectedSub.value("format", "");
+            if (!fmt.empty()) {
+                std::transform(fmt.begin(), fmt.end(), fmt.begin(), ::tolower);
+                subExt = "." + fmt;
+            }
+        } else if (selectedSub.contains("filename")) {
+            std::string fn = selectedSub.value("filename", "");
+            size_t p = fn.find_last_of('.');
+            if (p != std::string::npos && p + 1 < fn.size()) {
+                subExt = fn.substr(p);
+            }
+        }
 
-        std::ofstream out(srtPath);
+        std::string subPath = videoPath;
+        size_t dot = subPath.find_last_of(".");
+        if (dot != std::string::npos) subPath = subPath.substr(0, dot) + subExt;
+        else subPath += subExt;
+
+        std::ofstream out(subPath, std::ios::binary);
         out << subData;
         out.close();
 
@@ -324,12 +339,12 @@ void handleSubtitles(const std::string& imdbId, const std::string& season, int e
         if (lang.length() > 3) lang = lang.substr(0, 3);
         std::transform(lang.begin(), lang.end(), lang.begin(), ::tolower);
 
-        std::string cmd = "ffmpeg -y -i \"" + videoPath + "\" -i \"" + srtPath + "\" -c copy -c:s mov_text -metadata:s:s:0 language=" + lang + " \"" + tempVideoPath + "\" > /dev/null 2>&1";
+        std::string cmd = "ffmpeg -y -i \"" + videoPath + "\" -i \"" + subPath + "\" -c copy -c:s mov_text -metadata:s:s:0 language=" + lang + " \"" + tempVideoPath + "\" > /dev/null 2>&1";
         
         int res = std::system(cmd.c_str());
         if (res == 0) {
             fs::rename(tempVideoPath, videoPath);
-            fs::remove(srtPath);
+            fs::remove(subPath);
             log("[Subs] Embedded successfully.");
         } else {
             log("[Subs] ffmpeg failed.");
