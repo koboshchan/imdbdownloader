@@ -259,19 +259,27 @@ bool isShowType(const std::string& type) {
 
 // ── Subtitle management ──────────────────────────────────────────────────────
 
-void handleSubtitles(const std::string& imdbId, const std::string& season, int episode, const std::string& videoPath) {
+void handleSubtitles(const std::string& imdbId, const std::string& season, int episode, const std::string& videoPath, int workerId = 0, DownloadManager* manager = nullptr) {
     if (!g_config.embedSubs) return;
+
+    auto log = [&](const std::string& msg) {
+        if (manager && workerId > 0) {
+            manager->updateWorker(workerId, "Embedding", 100, nullptr, msg);
+        } else {
+            std::cout << msg << std::endl;
+        }
+    };
 
     try {
         std::string path = (episode > 0)
             ? "/subtitles/show/" + imdbId + "/" + season + "/" + std::to_string(episode)
             : "/subtitles/movie/" + imdbId;
 
-        std::cout << "[Subs] Fetching subtitles from " << path << "..." << std::endl;
+        log("[Subs] Fetching subtitles...");
         json subs = fetchAniApi(path);
         
         if (subs.empty()) {
-            std::cout << "[Subs] No subtitles found." << std::endl;
+            log("[Subs] No subtitles found.");
             return;
         }
 
@@ -293,7 +301,7 @@ void handleSubtitles(const std::string& imdbId, const std::string& season, int e
             subUrl = ANIAPI_BASE + subUrl;
         }
 
-        std::cout << "[Subs] Downloading " << selectedSub.value("language", "Unknown") << " subtitle..." << std::endl;
+        log("[Subs] Downloading " + selectedSub.value("language", "Unknown") + " subtitle...");
         std::string subData = fetchURL(subUrl, g_config.apiKey);
         
         std::string srtPath = videoPath;
@@ -305,7 +313,7 @@ void handleSubtitles(const std::string& imdbId, const std::string& season, int e
         out << subData;
         out.close();
 
-        std::cout << "[Subs] Embedding subtitle into " << videoPath << "..." << std::endl;
+        log("[Subs] Embedding subtitle...");
         std::string tempVideoPath = videoPath;
         dot = tempVideoPath.find_last_of(".");
         if (dot != std::string::npos) tempVideoPath = tempVideoPath.substr(0, dot) + ".temp.mp4";
@@ -321,13 +329,13 @@ void handleSubtitles(const std::string& imdbId, const std::string& season, int e
         if (res == 0) {
             fs::rename(tempVideoPath, videoPath);
             fs::remove(srtPath);
-            std::cout << "[Subs] Subtitle embedded successfully." << std::endl;
+            log("[Subs] Embedded successfully.");
         } else {
-            std::cerr << "[Subs] ffmpeg failed with code " << res << std::endl;
+            log("[Subs] ffmpeg failed.");
             if (fs::exists(tempVideoPath)) fs::remove(tempVideoPath);
         }
     } catch (const std::exception& e) {
-        std::cerr << "[Subs] Failed to embed subtitles: " << e.what() << std::endl;
+        log("[Subs] Failed.");
     }
 }
 
@@ -402,7 +410,7 @@ void downloadWorker(int workerId, DownloadManager* manager) {
 
             downloadStream(m3u8, outputPath, headers, g_config.fragments, workerId, manager);
 
-            handleSubtitles(task->imdbId, task->season, task->episode, outputPath);
+            handleSubtitles(task->imdbId, task->season, task->episode, outputPath, workerId, manager);
 
             task->downloaded = true;
             manager->updateWorker(workerId, "Done", 100, task);

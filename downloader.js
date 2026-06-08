@@ -166,24 +166,32 @@ function sanitizeFilename(name) {
 
 // ── Subtitle management ──────────────────────────────────────────────────────
 
-async function handleSubtitles(imdbId, season, episode, videoPath) {
+async function handleSubtitles(imdbId, season, episode, videoPath, workerId = 0, manager = null) {
   if (!config.embedSubs) return;
+
+  const log = (msg) => {
+    if (manager && workerId > 0) {
+      manager.updateWorker(workerId, { lastOutput: msg });
+    } else {
+      console.log(msg);
+    }
+  };
 
   try {
     const path = season 
       ? `/subtitles/show/${imdbId}/${season}/${episode}`
       : `/subtitles/movie/${imdbId}`;
     
-    console.log(`[Subs] Fetching subtitles from ${path}...`);
+    log(`[Subs] Fetching subtitles...`);
     const subs = await fetchAniApi(path);
     if (!subs || subs.length === 0) {
-      console.log('[Subs] No subtitles found.');
+      log('[Subs] No subtitles found.');
       return;
     }
 
     // Try to find preferred language, fallback to first
     const sub = subs.find(s => s.language.toLowerCase() === config.subLang.toLowerCase()) || subs[0];
-    console.log(`[Subs] Downloading ${sub.language} (${sub.format}) subtitle...`);
+    log(`[Subs] Downloading ${sub.language} subtitle...`);
 
     const subUrl = sub.url.startsWith('http') ? sub.url : `${ANIAPI_BASE}${sub.url}`;
     const subResponse = await axios.get(subUrl, { 
@@ -194,7 +202,7 @@ async function handleSubtitles(imdbId, season, episode, videoPath) {
     const srtPath = videoPath.replace(/\.mp4$/, '.srt');
     fs.writeFileSync(srtPath, subResponse.data);
 
-    console.log(`[Subs] Embedding subtitle into ${videoPath}...`);
+    log(`[Subs] Embedding subtitle...`);
     const tempVideoPath = videoPath.replace(/\.mp4$/, '.temp.mp4');
     
     // Mux with ffmpeg: copy video/audio, add subtitle as mov_text
@@ -219,9 +227,9 @@ async function handleSubtitles(imdbId, season, episode, videoPath) {
     // Replace original with muxed version and cleanup
     fs.renameSync(tempVideoPath, videoPath);
     fs.unlinkSync(srtPath);
-    console.log('[Subs] Subtitle embedded successfully.');
+    log('[Subs] Embedded successfully.');
   } catch (err) {
-    console.error(`[Subs] Failed to embed subtitles: ${err.message}`);
+    log(`[Subs] Error: ${err.message}`);
   }
 }
 
@@ -313,7 +321,7 @@ async function downloadWorker(workerId, manager, streamSourceFn) {
         manager.updateWorker(workerId, { lastOutput: line });
       });
 
-      await handleSubtitles(imdbId, season, episode, outputPath);
+      await handleSubtitles(imdbId, season, episode, outputPath, workerId, manager);
 
       task.downloaded = true;
       manager.updateWorker(workerId, { status: 'Done', progress: 100 });
