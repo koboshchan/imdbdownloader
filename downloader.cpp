@@ -26,6 +26,7 @@ struct Config {
     std::string apiKey;
     bool embedSubs = false;
     std::string subLang = "English";
+    std::string subImdbId;
 } g_config;
 
 const std::string ANIAPI_BASE = "https://aniapi.kobosh.com";
@@ -275,6 +276,7 @@ void handleSubtitles(const std::string& imdbId, const std::string& season, int e
     try {
         json selectedSub;
         std::string subUrl;
+        std::string effectiveImdbId = g_config.subImdbId.empty() ? imdbId : g_config.subImdbId;
 
         if (!directSubUrl.empty()) {
             subUrl = directSubUrl;
@@ -297,9 +299,13 @@ void handleSubtitles(const std::string& imdbId, const std::string& season, int e
             selectedSub["filename"] = "subtitle." + ext;
             log("[Subs] Downloading subtitle from /download response...");
         } else {
+            if (effectiveImdbId.empty()) {
+                log("[Subs] No IMDb ID available for subtitles.");
+                return;
+            }
             std::string path = (episode > 0)
-                ? "/subtitles/show/" + imdbId + "/" + season + "/" + std::to_string(episode)
-                : "/subtitles/movie/" + imdbId;
+                ? "/subtitles/show/" + effectiveImdbId + "/" + season + "/" + std::to_string(episode)
+                : "/subtitles/movie/" + effectiveImdbId;
 
             log("[Subs] Fetching subtitles...");
             json subs = fetchAniApi(path);
@@ -645,9 +651,10 @@ void printHelp() {
               << "Options:\n"
               << "  --key <apikey>                   AniAPI key (falls back to ANIAPI_TOKEN env var)\n"
               << "  -t, --threads <number>           Number of concurrent downloads (shows only) [default: 3]\n"
-              << "  --concurrent-fragments <number>  Number of concurrent fragments per download [default: 8]\n"
-              << "  --embed-subs                     Automatically download and embed subtitles\n"
-              << "  --sub-lang <lang>                Preferred subtitle language [default: English]\n\n"
+              << "  -f, --concurrent-fragments <n>   Number of concurrent fragments per download [default: 8]\n"
+              << "  -s, --embed-subs                 Automatically download and embed subtitles\n"
+              << "  -l, --sub-lang <lang>            Preferred subtitle language [default: English]\n"
+              << "  -i, --imdb <id>                  IMDB ID of the show (used for subtitles)\n\n"
               << "Examples:\n"
               << "  $ imdbdownloader tt0480489 --embed-subs\n"
               << "  $ imdbdownloader tt0480489 --key YOUR_API_KEY --embed-subs --sub-lang Hungarian\n";
@@ -674,13 +681,19 @@ int main(int argc, char* argv[]) {
             g_config.apiKey = trim(argv[++i]);
         } else if ((arg == "-t" || arg == "--threads") && i + 1 < argc) {
             g_config.threads = std::stoi(argv[++i]);
-        } else if (arg == "--concurrent-fragments" && i + 1 < argc) {
+        } else if ((arg == "-f" || arg == "--concurrent-fragments") && i + 1 < argc) {
             g_config.fragments = std::stoi(argv[++i]);
-        } else if (arg == "--embed-subs") {
+        } else if (arg == "-s" || arg == "--embed-subs") {
             g_config.embedSubs = true;
-        } else if (arg == "--sub-lang" && i + 1 < argc) {
+        } else if ((arg == "-l" || arg == "--sub-lang") && i + 1 < argc) {
             g_config.subLang = argv[++i];
+        } else if ((arg == "-i" || arg == "--imdb") && i + 1 < argc) {
+            g_config.subImdbId = argv[++i];
         }
+    }
+
+    if (g_config.subImdbId.empty() && imdbId.length() >= 2 && imdbId.substr(0, 2) == "tt") {
+        g_config.subImdbId = imdbId;
     }
 
     if (g_config.apiKey.empty()) {

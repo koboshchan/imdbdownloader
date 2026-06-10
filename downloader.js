@@ -17,6 +17,7 @@ const config = {
   apiKey: '',
   embedSubs: false,
   subLang: 'English',
+  subImdbId: '',
 };
 
 const ANIAPI_BASE   = 'https://aniapi.kobosh.com';
@@ -180,6 +181,7 @@ async function handleSubtitles(imdbId, season, episode, videoPath, workerId = 0,
   try {
     let sub;
     let subUrl;
+    const effectiveImdbId = config.subImdbId || imdbId;
 
     if (directSubUrl) {
       subUrl = directSubUrl.startsWith('http') ? directSubUrl : `${ANIAPI_BASE}${directSubUrl}`;
@@ -197,9 +199,13 @@ async function handleSubtitles(imdbId, season, episode, videoPath, workerId = 0,
       };
       log(`[Subs] Downloading subtitle from /download response...`);
     } else {
+      if (!effectiveImdbId) {
+        log('[Subs] No IMDb ID available for subtitles.');
+        return;
+      }
       const path = season 
-        ? `/subtitles/show/${imdbId}/${season}/${episode}`
-        : `/subtitles/movie/${imdbId}`;
+        ? `/subtitles/show/${effectiveImdbId}/${season}/${episode}`
+        : `/subtitles/movie/${effectiveImdbId}`;
 
       log(`[Subs] Fetching subtitles...`);
       const subs = await fetchAniApi(path);
@@ -551,9 +557,10 @@ async function main() {
     .argument('<imdb_id>', 'IMDB ID (e.g. tt0480489)')
     .option('--key <apikey>', 'AniAPI key (falls back to ANIAPI_TOKEN env var)')
     .option('-t, --threads <number>', 'Number of concurrent downloads (shows only)', '3')
-    .option('--concurrent-fragments <number>', 'Number of concurrent fragments per download', '8')
-    .option('--embed-subs', 'Automatically download and embed subtitles', false)
-    .option('--sub-lang <lang>', 'Preferred subtitle language', 'English')
+    .option('-f, --concurrent-fragments <number>', 'Number of concurrent fragments per download', '8')
+    .option('-s, --embed-subs', 'Automatically download and embed subtitles', false)
+    .option('-l, --sub-lang <lang>', 'Preferred subtitle language', 'English')
+    .option('-i, --imdb <id>', 'IMDB ID of the show (used for subtitles)')
     .addHelpText('after', `
 Examples:
   $ imdbdownloader tt0480489 --embed-subs
@@ -573,6 +580,7 @@ Note: when using "npm start", pass flags after "--":
   config.apiKey    = (opts.key || process.env.ANIAPI_TOKEN || '').toString().trim().replace(/['"]/g, '');
   config.embedSubs = !!opts.embedSubs;
   config.subLang   = opts.subLang || 'English';
+  config.subImdbId = opts.imdb || (imdbId && imdbId.startsWith('tt') ? imdbId : '');
 
   if (!config.apiKey) {
     console.error('Error: API key required. Contact @kobosh_com on telegram/@kobosh.com on discord for a api key');
