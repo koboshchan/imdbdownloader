@@ -166,7 +166,7 @@ function sanitizeFilename(name) {
 
 // ── Subtitle management ──────────────────────────────────────────────────────
 
-async function handleSubtitles(imdbId, season, episode, videoPath, workerId = 0, manager = null) {
+async function handleSubtitles(imdbId, season, episode, videoPath, workerId = 0, manager = null, directSubUrl = null) {
   if (!config.embedSubs) return;
 
   const log = (msg) => {
@@ -178,23 +178,43 @@ async function handleSubtitles(imdbId, season, episode, videoPath, workerId = 0,
   };
 
   try {
-    const path = season 
-      ? `/subtitles/show/${imdbId}/${season}/${episode}`
-      : `/subtitles/movie/${imdbId}`;
-    
-    log(`[Subs] Fetching subtitles...`);
-    const subs = await fetchAniApi(path);
-    if (!subs || subs.length === 0) {
-      log('[Subs] No subtitles found.');
-      return;
+    let sub;
+    let subUrl;
+
+    if (directSubUrl) {
+      subUrl = directSubUrl.startsWith('http') ? directSubUrl : `${ANIAPI_BASE}${directSubUrl}`;
+      const guessedExt = (() => {
+        const clean = subUrl.split('?')[0];
+        const dot = clean.lastIndexOf('.');
+        if (dot === -1) return 'vtt';
+        return clean.slice(dot + 1).toLowerCase() || 'vtt';
+      })();
+      sub = {
+        language: config.subLang || 'English',
+        format: guessedExt,
+        filename: `subtitle.${guessedExt}`,
+        url: subUrl,
+      };
+      log(`[Subs] Downloading subtitle from /download response...`);
+    } else {
+      const path = season 
+        ? `/subtitles/show/${imdbId}/${season}/${episode}`
+        : `/subtitles/movie/${imdbId}`;
+
+      log(`[Subs] Fetching subtitles...`);
+      const subs = await fetchAniApi(path);
+      if (!subs || subs.length === 0) {
+        log('[Subs] No subtitles found.');
+        return;
+      }
+
+      // API returns all candidates sorted by rating; prefer configured language then top item.
+      const prefLang = (config.subLang || '').toLowerCase();
+      sub = subs.find(s => (s.language || '').toLowerCase() === prefLang) || subs[0];
+      subUrl = sub.url.startsWith('http') ? sub.url : `${ANIAPI_BASE}${sub.url}`;
+      log(`[Subs] Downloading ${sub.language} subtitle...`);
     }
 
-    // New API returns all candidates sorted by rating; prefer configured language then top item.
-    const prefLang = (config.subLang || '').toLowerCase();
-    const sub = subs.find(s => (s.language || '').toLowerCase() === prefLang) || subs[0];
-    log(`[Subs] Downloading ${sub.language} subtitle...`);
-
-    const subUrl = sub.url.startsWith('http') ? sub.url : `${ANIAPI_BASE}${sub.url}`;
     const subResponse = await axios.get(subUrl, { 
       headers: { 'x-api-key': config.apiKey },
       responseType: 'arraybuffer' 
@@ -218,7 +238,7 @@ async function handleSubtitles(imdbId, season, episode, videoPath, workerId = 0,
       '-i', subPath,
       '-c', 'copy',
       '-c:s', 'mov_text',
-      '-metadata:s:s:0', `language=${sub.language.slice(0, 3).toLowerCase()}`,
+      '-metadata:s:s:0', `language=${(sub.language || 'eng').slice(0, 3).toLowerCase()}`,
       tempVideoPath
     ];
 
@@ -344,7 +364,7 @@ async function downloadWorker(workerId, manager, streamSourceFn) {
         manager.updateWorker(workerId, { lastOutput: line });
       });
 
-      await handleSubtitles(imdbId, season, episode, outputPath, workerId, manager);
+      await handleSubtitles(imdbId, season, episode, outputPath, workerId, manager, task.sub || null);
 
       task.downloaded = true;
       manager.updateWorker(workerId, { status: 'Done', progress: 100 });
@@ -369,6 +389,7 @@ async function handleMovie(imdbId, title) {
 
   const streamUrl = movieData?.streamUrl || '';
   const headers = movieData?.headers || {};
+  const sub = movieData?.sub || null;
   if (!streamUrl) {
     console.error('No streams found for this movie.');
     return;
@@ -380,7 +401,7 @@ async function handleMovie(imdbId, title) {
   
   const outputPath = `${base}.mp4`;
   await downloadStream(streamUrl, outputPath, headers, null, config.fragments);
-  await handleSubtitles(imdbId, null, null, outputPath);
+  await handleSubtitles(imdbId, null, null, outputPath, 0, null, sub);
   console.log('\nDownload complete.');
 }
 
@@ -412,12 +433,13 @@ async function handleShow(imdbId, title, _originalTitle, epsData) {
         const epRes = await fetchAniApi(`/download/show/${imdbId}/${chosenSeason}/${chosenEp}`);
         const streamUrl = epRes?.streamUrl || '';
         const headers = epRes?.headers || {};
+        const sub = epRes?.sub || null;
         if (streamUrl) {
           const base = `./${cleanTitle}-S${chosenSeason}-E${chosenEp}`;
           const outputPath = `${base}.mp4`;
           console.log(`\nDownloading S${chosenSeason}E${chosenEp}...`);
           await downloadStream(streamUrl, outputPath, headers, null, config.fragments);
-          await handleSubtitles(imdbId, chosenSeason, chosenEp, outputPath);
+          await handleSubtitles(imdbId, chosenSeason, chosenEp, outputPath, 0, null, sub);
           console.log('\nDownload complete.');
         } else {
           console.error('No stream found via primary source.');
@@ -448,6 +470,7 @@ async function handleShow(imdbId, title, _originalTitle, epsData) {
       const sourceFn = async (task) => {
         const res = await fetchAniApi(`/download/show/${task.imdbId}/${task.season}/${task.episode}`);
         task.extraHeaders = res?.headers || {};
+        task.sub = res?.sub || null;
         return res?.streamUrl || null;
       };
 
@@ -481,6 +504,7 @@ async function handleShow(imdbId, title, _originalTitle, epsData) {
     const epRes = await fetchAniApi(`/download/show/${imdbId}/${chosenSeason}/${chosenEp}`);
     const streamUrl = epRes?.streamUrl || '';
     const headers = epRes?.headers || {};
+    const sub = epRes?.sub || null;
     if (!streamUrl) {
       console.error('No stream found for that episode.');
       return;
@@ -489,7 +513,7 @@ async function handleShow(imdbId, title, _originalTitle, epsData) {
     const outputPath = `${base}.mp4`;
     console.log(`\nDownloading S${chosenSeason}E${chosenEp}...`);
     await downloadStream(streamUrl, outputPath, headers, null, config.fragments);
-    await handleSubtitles(imdbId, chosenSeason, chosenEp, outputPath);
+    await handleSubtitles(imdbId, chosenSeason, chosenEp, outputPath, 0, null, sub);
     console.log('\nDownload complete.');
   } catch (err) {
     console.error('AniAPI episode download failed:', err.message);

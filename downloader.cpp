@@ -94,6 +94,7 @@ struct Task {
     std::string baseDir;
     std::string fileNameBase;
     std::string imdbId;
+    std::string subUrl;
     bool downloaded = false;
     int claimedBy = -1; // -1 for unclaimed
     bool failed = false;
@@ -260,7 +261,7 @@ bool isShowType(const std::string& type) {
 
 // ── Subtitle management ──────────────────────────────────────────────────────
 
-void handleSubtitles(const std::string& imdbId, const std::string& season, int episode, const std::string& videoPath, int workerId = 0, DownloadManager* manager = nullptr) {
+void handleSubtitles(const std::string& imdbId, const std::string& season, int episode, const std::string& videoPath, int workerId = 0, DownloadManager* manager = nullptr, const std::string& directSubUrl = "") {
     if (!g_config.embedSubs) return;
 
     auto log = [&](const std::string& msg) {
@@ -272,37 +273,63 @@ void handleSubtitles(const std::string& imdbId, const std::string& season, int e
     };
 
     try {
-        std::string path = (episode > 0)
-            ? "/subtitles/show/" + imdbId + "/" + season + "/" + std::to_string(episode)
-            : "/subtitles/movie/" + imdbId;
+        json selectedSub;
+        std::string subUrl;
 
-        log("[Subs] Fetching subtitles...");
-        json subs = fetchAniApi(path);
-        
-        if (subs.empty()) {
-            log("[Subs] No subtitles found.");
-            return;
-        }
-
-        // New API returns all candidates sorted by rating; prefer configured language then top item.
-        json selectedSub = subs[0];
-        for (const auto& s : subs) {
-            std::string lang = s.value("language", "");
-            std::transform(lang.begin(), lang.end(), lang.begin(), ::tolower);
-            std::string pref = g_config.subLang;
-            std::transform(pref.begin(), pref.end(), pref.begin(), ::tolower);
-            if (lang == pref) {
-                selectedSub = s;
-                break;
+        if (!directSubUrl.empty()) {
+            subUrl = directSubUrl;
+            if (subUrl.find("http") != 0) {
+                subUrl = ANIAPI_BASE + subUrl;
             }
+
+            std::string ext = "vtt";
+            std::string cleanUrl = subUrl;
+            size_t q = cleanUrl.find('?');
+            if (q != std::string::npos) cleanUrl = cleanUrl.substr(0, q);
+            size_t dotPos = cleanUrl.find_last_of('.');
+            if (dotPos != std::string::npos && dotPos + 1 < cleanUrl.size()) {
+                ext = cleanUrl.substr(dotPos + 1);
+                std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+            }
+
+            selectedSub["language"] = g_config.subLang.empty() ? "English" : g_config.subLang;
+            selectedSub["format"] = ext;
+            selectedSub["filename"] = "subtitle." + ext;
+            log("[Subs] Downloading subtitle from /download response...");
+        } else {
+            std::string path = (episode > 0)
+                ? "/subtitles/show/" + imdbId + "/" + season + "/" + std::to_string(episode)
+                : "/subtitles/movie/" + imdbId;
+
+            log("[Subs] Fetching subtitles...");
+            json subs = fetchAniApi(path);
+
+            if (subs.empty()) {
+                log("[Subs] No subtitles found.");
+                return;
+            }
+
+            // API returns all candidates sorted by rating; prefer configured language then top item.
+            selectedSub = subs[0];
+            for (const auto& s : subs) {
+                std::string lang = s.value("language", "");
+                std::transform(lang.begin(), lang.end(), lang.begin(), ::tolower);
+                std::string pref = g_config.subLang;
+                std::transform(pref.begin(), pref.end(), pref.begin(), ::tolower);
+                if (lang == pref) {
+                    selectedSub = s;
+                    break;
+                }
+            }
+
+            subUrl = selectedSub.value("url", "");
+            if (subUrl.find("http") != 0) {
+                subUrl = ANIAPI_BASE + subUrl;
+            }
+
+            log("[Subs] Downloading " + selectedSub.value("language", "Unknown") + " subtitle...");
         }
 
-        std::string subUrl = selectedSub.value("url", "");
-        if (subUrl.find("http") != 0) {
-            subUrl = ANIAPI_BASE + subUrl;
-        }
-
-        log("[Subs] Downloading " + selectedSub.value("language", "Unknown") + " subtitle...");
         std::string subData = fetchURL(subUrl, g_config.apiKey);
         
         std::string subExt = ".srt";
@@ -434,6 +461,7 @@ void downloadWorker(int workerId, DownloadManager* manager) {
             json epRes = fetchAniApi("/download/show/" + task->imdbId + "/" + task->season + "/" + std::to_string(task->episode));
             std::string m3u8 = epRes.value("streamUrl", "");
             json headers = epRes.value("headers", json::object());
+            task->subUrl = epRes.value("sub", "");
 
             if (m3u8.empty()) throw std::runtime_error("No stream URL");
 
@@ -442,7 +470,7 @@ void downloadWorker(int workerId, DownloadManager* manager) {
 
             downloadStream(m3u8, outputPath, headers, g_config.fragments, workerId, manager);
 
-            handleSubtitles(task->imdbId, task->season, task->episode, outputPath, workerId, manager);
+            handleSubtitles(task->imdbId, task->season, task->episode, outputPath, workerId, manager, task->subUrl);
 
             task->downloaded = true;
             manager->updateWorker(workerId, "Done", 100, task);
@@ -467,6 +495,7 @@ void handleMovie(const std::string& imdbId, const std::string& title) {
 
     std::string streamUrl = movieData.value("streamUrl", "");
     json headers = movieData.value("headers", json::object());
+    std::string subUrl = movieData.value("sub", "");
     if (streamUrl.empty()) {
         std::cerr << "No streams found for this movie." << std::endl;
         return;
@@ -478,7 +507,7 @@ void handleMovie(const std::string& imdbId, const std::string& title) {
     std::cout << "Downloading to " << outputPath << "..." << std::endl;
     
     downloadStream(streamUrl, outputPath, headers, g_config.fragments);
-    handleSubtitles(imdbId, "", 0, outputPath);
+    handleSubtitles(imdbId, "", 0, outputPath, 0, nullptr, subUrl);
     std::cout << "\nDownload complete." << std::endl;
 }
 
@@ -512,12 +541,13 @@ void handleShow(const std::string& imdbId, const std::string& title, const json&
                 json epRes = fetchAniApi("/download/show/" + imdbId + "/" + chosenSeason + "/" + std::to_string(chosenEp));
                 std::string streamUrl = epRes.value("streamUrl", "");
                 json headers = epRes.value("headers", json::object());
+                std::string subUrl = epRes.value("sub", "");
                 if (!streamUrl.empty()) {
                     std::string base = "./" + cleanTitle + "-S" + chosenSeason + "-E" + std::to_string(chosenEp);
                     std::string outputPath = base + ".mp4";
                     std::cout << "\nDownloading S" << chosenSeason << "E" << chosenEp << "..." << std::endl;
                     downloadStream(streamUrl, outputPath, headers, g_config.fragments);
-                    handleSubtitles(imdbId, chosenSeason, chosenEp, outputPath);
+                    handleSubtitles(imdbId, chosenSeason, chosenEp, outputPath, 0, nullptr, subUrl);
                     std::cout << "\nDownload complete." << std::endl;
                 } else {
                     std::cerr << "No stream found via primary source." << std::endl;
@@ -576,6 +606,7 @@ void handleShow(const std::string& imdbId, const std::string& title, const json&
         json epRes = fetchAniApi("/download/show/" + imdbId + "/" + chosenSeason + "/" + std::to_string(chosenEp));
         std::string streamUrl = epRes.value("streamUrl", "");
         json headers = epRes.value("headers", json::object());
+        std::string subUrl = epRes.value("sub", "");
         if (streamUrl.empty()) {
             std::cerr << "No stream found for that episode." << std::endl;
             return;
@@ -584,7 +615,7 @@ void handleShow(const std::string& imdbId, const std::string& title, const json&
         std::string outputPath = base + ".mp4";
         std::cout << "\nDownloading S" << chosenSeason << "E" << chosenEp << "..." << std::endl;
         downloadStream(streamUrl, outputPath, headers, g_config.fragments);
-        handleSubtitles(imdbId, chosenSeason, chosenEp, outputPath);
+        handleSubtitles(imdbId, chosenSeason, chosenEp, outputPath, 0, nullptr, subUrl);
         std::cout << "\nDownload complete." << std::endl;
     } catch (const std::exception& e) {
         std::cerr << "AniAPI episode download failed: " << e.what() << std::endl;
