@@ -52,6 +52,14 @@ std::string sanitizeFilename(std::string name) {
     return std::regex_replace(name, re, "");
 }
 
+template<typename T>
+T jval(const json& j, const std::string& key, T def) {
+    if (j.contains(key) && !j[key].is_null()) {
+        try { return j[key].get<T>(); } catch(...) { return def; }
+    }
+    return def;
+}
+
 size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* userp) {
     ((std::string*)userp)->append((char*)contents, size * nmemb);
     return size * nmemb;
@@ -232,17 +240,17 @@ struct Metadata {
 Metadata fetchImdbMetadata(const std::string& imdbId) {
     try {
         json d = fetchAniApi("/info/" + imdbId);
-        if (d.contains("error")) {
+        if (d.contains("error") && !d["error"].is_null()) {
             throw std::runtime_error(d["error"].get<std::string>());
         }
         Metadata m;
-        m.title = d.value("title", d.value("originalTitle", imdbId));
-        m.originalTitle = d.value("originalTitle", d.value("title", imdbId));
-        m.type = d.value("mediaType", d.value("type", "movie"));
-        if (d.contains("genres")) m.genres = d["genres"].get<std::vector<std::string>>();
-        m.startYear = d.value("year", 0);
+        m.title = jval(d, "title", jval(d, "originalTitle", imdbId));
+        m.originalTitle = jval(d, "originalTitle", jval(d, "title", imdbId));
+        m.type = jval(d, "mediaType", jval(d, "type", std::string("movie")));
+        if (d.contains("genres") && !d["genres"].is_null()) m.genres = d["genres"].get<std::vector<std::string>>();
+        m.startYear = jval(d, "year", 0);
         if (d.contains("episodes")) m.episodes = d["episodes"];
-        m.hasPrimaryStream = d.value("hasPrimaryStream", true);
+        m.hasPrimaryStream = jval(d, "hasPrimaryStream", true);
         return m;
     } catch (const std::exception& e) {
         std::cerr << "[Meta] AniAPI lookup failed: " << e.what() << std::endl;
@@ -318,7 +326,7 @@ void handleSubtitles(const std::string& imdbId, const std::string& season, int e
             // API returns all candidates sorted by rating; prefer configured language then top item.
             selectedSub = subs[0];
             for (const auto& s : subs) {
-                std::string lang = s.value("language", "");
+                std::string lang = jval(s, "language", std::string(""));
                 std::transform(lang.begin(), lang.end(), lang.begin(), ::tolower);
                 std::string pref = g_config.subLang;
                 std::transform(pref.begin(), pref.end(), pref.begin(), ::tolower);
@@ -328,25 +336,25 @@ void handleSubtitles(const std::string& imdbId, const std::string& season, int e
                 }
             }
 
-            subUrl = selectedSub.value("url", "");
+            subUrl = jval(selectedSub, "url", std::string(""));
             if (subUrl.find("http") != 0) {
                 subUrl = ANIAPI_BASE + subUrl;
             }
 
-            log("[Subs] Downloading " + selectedSub.value("language", "Unknown") + " subtitle...");
+            log("[Subs] Downloading " + jval(selectedSub, "language", std::string("Unknown")) + " subtitle...");
         }
 
         std::string subData = fetchURL(subUrl, g_config.apiKey);
         
         std::string subExt = ".srt";
-        if (selectedSub.contains("format")) {
-            std::string fmt = selectedSub.value("format", "");
+        if (selectedSub.contains("format") && !selectedSub["format"].is_null()) {
+            std::string fmt = jval(selectedSub, "format", std::string(""));
             if (!fmt.empty()) {
                 std::transform(fmt.begin(), fmt.end(), fmt.begin(), ::tolower);
                 subExt = "." + fmt;
             }
-        } else if (selectedSub.contains("filename")) {
-            std::string fn = selectedSub.value("filename", "");
+        } else if (selectedSub.contains("filename") && !selectedSub["filename"].is_null()) {
+            std::string fn = jval(selectedSub, "filename", std::string(""));
             size_t p = fn.find_last_of('.');
             if (p != std::string::npos && p + 1 < fn.size()) {
                 subExt = fn.substr(p);
@@ -368,7 +376,7 @@ void handleSubtitles(const std::string& imdbId, const std::string& season, int e
         if (dot != std::string::npos) tempVideoPath = tempVideoPath.substr(0, dot) + ".temp.mp4";
         else tempVideoPath += ".temp.mp4";
 
-        std::string lang = selectedSub.value("language", "eng");
+        std::string lang = jval(selectedSub, "language", std::string("eng"));
         if (lang.length() > 3) lang = lang.substr(0, 3);
         std::transform(lang.begin(), lang.end(), lang.begin(), ::tolower);
 
@@ -465,9 +473,9 @@ void downloadWorker(int workerId, DownloadManager* manager) {
 
         try {
             json epRes = fetchAniApi("/download/show/" + task->imdbId + "/" + task->season + "/" + std::to_string(task->episode));
-            std::string m3u8 = epRes.value("streamUrl", "");
-            json headers = epRes.value("headers", json::object());
-            task->subUrl = epRes.value("sub", "");
+            std::string m3u8 = jval(epRes, "streamUrl", std::string(""));
+            json headers = jval(epRes, "headers", json::object());
+            task->subUrl = jval(epRes, "sub", std::string(""));
 
             if (m3u8.empty()) throw std::runtime_error("No stream URL");
 
@@ -499,9 +507,9 @@ void handleMovie(const std::string& imdbId, const std::string& title) {
         return;
     }
 
-    std::string streamUrl = movieData.value("streamUrl", "");
-    json headers = movieData.value("headers", json::object());
-    std::string subUrl = movieData.value("sub", "");
+    std::string streamUrl = jval(movieData, "streamUrl", std::string(""));
+    json headers = jval(movieData, "headers", json::object());
+    std::string subUrl = jval(movieData, "sub", std::string(""));
     if (streamUrl.empty()) {
         std::cerr << "No streams found for this movie." << std::endl;
         return;
@@ -545,9 +553,9 @@ void handleShow(const std::string& imdbId, const std::string& title, const json&
 
             try {
                 json epRes = fetchAniApi("/download/show/" + imdbId + "/" + chosenSeason + "/" + std::to_string(chosenEp));
-                std::string streamUrl = epRes.value("streamUrl", "");
-                json headers = epRes.value("headers", json::object());
-                std::string subUrl = epRes.value("sub", "");
+                std::string streamUrl = jval(epRes, "streamUrl", std::string(""));
+                json headers = jval(epRes, "headers", json::object());
+                std::string subUrl = jval(epRes, "sub", std::string(""));
                 if (!streamUrl.empty()) {
                     std::string base = "./" + cleanTitle + "-S" + chosenSeason + "-E" + std::to_string(chosenEp);
                     std::string outputPath = base + ".mp4";
@@ -610,9 +618,9 @@ void handleShow(const std::string& imdbId, const std::string& title, const json&
 
     try {
         json epRes = fetchAniApi("/download/show/" + imdbId + "/" + chosenSeason + "/" + std::to_string(chosenEp));
-        std::string streamUrl = epRes.value("streamUrl", "");
-        json headers = epRes.value("headers", json::object());
-        std::string subUrl = epRes.value("sub", "");
+        std::string streamUrl = jval(epRes, "streamUrl", std::string(""));
+        json headers = jval(epRes, "headers", json::object());
+        std::string subUrl = jval(epRes, "sub", std::string(""));
         if (streamUrl.empty()) {
             std::cerr << "No stream found for that episode." << std::endl;
             return;
