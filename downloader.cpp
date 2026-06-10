@@ -363,7 +363,7 @@ void downloadStream(const std::string& m3u8Url, const std::string& outputPath, c
     std::string userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:152.0) Gecko/20100101 Firefox/152.0";
     if (extraHeaders.contains("User-Agent")) userAgent = extraHeaders["User-Agent"].get<std::string>();
 
-    std::string cmd = "yt-dlp --user-agent \"" + userAgent + "\" --concurrent-fragments " + std::to_string(fragments) + " --extractor-args \"generic:impersonate\" --newline ";
+    std::string cmd = "yt-dlp -f \"bestvideo+bestaudio/best\" --format-sort \"res,quality\" --user-agent \"" + userAgent + "\" --concurrent-fragments " + std::to_string(fragments) + " --extractor-args \"generic:impersonate\" --newline ";
     
     if (extraHeaders.contains("Referer")) {
         cmd += "--referer \"" + extraHeaders["Referer"].get<std::string>() + "\" ";

@@ -245,6 +245,8 @@ async function downloadStream(m3u8Url, outputPath, extraHeaders = {}, onProgress
   const userAgent = extraHeaders['User-Agent']
     || 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:152.0) Gecko/20100101 Firefox/152.0';
   const args = [
+    '-f', 'bestvideo+bestaudio/best',
+    '--format-sort', 'res,quality',
     '--user-agent', userAgent,
     '--concurrent-fragments', String(fragments),
     '--extractor-args', 'generic:impersonate',
