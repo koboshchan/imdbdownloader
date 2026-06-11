@@ -537,8 +537,8 @@ void handleShow(const std::string& imdbId, const std::string& title, const json&
             std::cout << "  Season " << it.key() << " (" << count << " episodes)" << std::endl;
         }
 
-        std::cout << "\nOptions:\n  1. Download one specific episode\n  2. Download ALL episodes" << std::endl;
-        std::cout << "Choose an option (1-2): ";
+        std::cout << "\nOptions:\n  1. Download one specific episode\n  2. Download one season\n  3. Download ALL episodes" << std::endl;
+        std::cout << "Choose an option (1-3): ";
         int mode;
         if (!(std::cin >> mode)) return;
         std::string cleanTitle = sanitizeFilename(title);
@@ -570,6 +570,44 @@ void handleShow(const std::string& imdbId, const std::string& title, const json&
                 std::cerr << "Primary source failed for that episode." << std::endl;
             }
         } else if (mode == 2) {
+            std::string chosenSeason;
+            std::cout << "Enter Season Number: ";
+            std::cin >> chosenSeason;
+
+            if (!epsData.contains(chosenSeason)) {
+                std::cerr << "Season " << chosenSeason << " not found." << std::endl;
+                return;
+            }
+
+            DownloadManager manager(g_config.threads);
+            int epCount = epsData[chosenSeason].is_array() ? epsData[chosenSeason].size() : epsData[chosenSeason].get<int>();
+            for (int ep = 1; ep <= epCount; ++ep) {
+                Task t;
+                t.season = chosenSeason;
+                t.episode = ep;
+                t.baseDir = "./" + cleanTitle + "/Season_" + chosenSeason;
+                t.fileNameBase = t.baseDir + "/" + cleanTitle + "-S" + chosenSeason + "-E" + std::to_string(ep);
+                t.imdbId = imdbId;
+                manager.addTask(t);
+            }
+
+            std::cout << "\nStarting bulk download of Season " << chosenSeason << " (" << manager.tasks.size() << " episodes) with " << g_config.threads << " threads..." << std::endl;
+            manager.startBulk();
+
+            std::vector<std::thread> workers;
+            for (int i = 0; i < g_config.threads; ++i) {
+                workers.emplace_back(downloadWorker, i + 1, &manager);
+            }
+            for (auto& w : workers) w.join();
+            
+            int failedCount = 0;
+            for (const auto& t : manager.tasks) if (t.failed) failedCount++;
+            if (failedCount > 0) {
+                std::cout << "\nNot all eps are downloaded and they need to run the command again" << std::endl;
+            } else {
+                std::cout << "\nAll downloads completed." << std::endl;
+            }
+        } else if (mode == 3) {
             DownloadManager manager(g_config.threads);
             for (const auto& s : seasons) {
                 int epCount = epsData[s].is_array() ? epsData[s].size() : epsData[s].get<int>();

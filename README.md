@@ -1,59 +1,59 @@
 # imdbdownloader
 
-Downloads movies and TV shows by IMDB ID using yt-dlp and ffmpeg. Subtitles are fetched automatically. Falls back to **AnimePahe** for anime titles when the primary stream source is unavailable.
+Downloads movies and TV shows by IMDB ID using yt-dlp and ffmpeg. Subtitles are fetched automatically from AniAPI.
 
 ## Requirements
 
-- Node.js 18+
-- `yt-dlp`, `ffmpeg`, and `unar` in PATH
+- A C++17 compiler (e.g. `g++` or `clang++`)
+- `libcurl`
+- `nlohmann-json` (already handled in source, or installed via package manager)
+- `yt-dlp` and `ffmpeg` in PATH
 
 ### macOS
 
 ```bash
-brew install yt-dlp ffmpeg unar
+brew install yt-dlp ffmpeg curl nlohmann-json
 ```
 
 ### Linux (Debian/Ubuntu)
 
 ```bash
-sudo apt install unar ffmpeg
+sudo apt install build-essential libcurl4-openssl-dev nlohmann-json3-dev ffmpeg
 pip install yt-dlp
 ```
 
-## Setup
+## Setup & Build
+
+Build the project using `make`:
 
 ```bash
-npm install
+make
 ```
 
 ## Install to PATH
 
 ```bash
-sudo npm run install-bin
+sudo make install
 ```
 
-This copies `downloader.js` to `/usr/local/bin/imdbdownloader` so you can run it from anywhere.
+This installs `imdbdownloader` to `/usr/local/bin/imdbdownloader` so you can run it from anywhere.
 
 ## Usage
 
 ```bash
 imdbdownloader <IMDB_ID> [options]
-# or without installing:
-node downloader.js <IMDB_ID> [options]
 ```
 
 **Options:**
 
 | Flag | Description |
 |------|-------------|
-| `--embed-subs` | Mux subtitles into the output file as a soft subtitle track |
-| `--no-subs` | Skip subtitle download entirely |
-| `--lang <language>` | Subtitle language (default: English) |
-
-> **Note:** When running via `npm start`, pass flags after `--`:
-> ```bash
-> npm start -- tt0480489 --embed-subs
-> ```
+| `--key <apikey>` | AniAPI key (falls back to `ANIAPI_TOKEN` environment variable) |
+| `-t, --threads <number>` | Number of concurrent downloads (shows only, default: 3) |
+| `-f, --concurrent-fragments <n>` | Number of concurrent fragments per download (default: 8) |
+| `-s, --embed-subs` | Automatically download and embed subtitles as a soft subtitle track |
+| `-l, --sub-lang <lang>` | Preferred subtitle language (default: English) |
+| `-i, --imdb <id>` | IMDB ID of the show (used for subtitles) |
 
 ## Examples
 
@@ -67,38 +67,25 @@ Download a movie with embedded subtitles:
 imdbdownloader tt5311514 --embed-subs
 ```
 
-Download a TV show (prompts for episode selection):
+Download a TV show (prompts for episode, season, or all download option):
 ```bash
 imdbdownloader tt0480489
 ```
 
-Download an anime (automatically uses AnimePahe if primary source fails):
-```bash
-imdbdownloader tt13370404
-```
-
 Download with Japanese subtitles:
 ```bash
-imdbdownloader tt13370404 --lang Japanese
+imdbdownloader tt0480489 --sub-lang Japanese
 ```
 
 ## Output
 
 - Movies are saved to `./<Title>.mp4` in the current directory.
-- TV shows are saved to `./<Title>/Season_N/<Title>-SN-EN.mp4`.
-- Subtitle files are saved alongside the video as `.srt` unless `--embed-subs` is used.
+- TV Shows are saved to `./<Title>/Season_N/<Title>-SN-EN.mp4` for season or bulk downloads.
+- Subtitle files are saved alongside the video as `.srt` or `.vtt` unless `--embed-subs` is used to soft-embed them directly inside the mp4 container.
 
-## Stream Sources
+## Stream & Metadata Sources
 
-1. **Primary:** `streamdata.vaplayer.ru` — general movies and TV shows
-2. **Fallback:** [AnimePahe](https://animepahe.ru) — anime titles (auto-used when primary fails)
-
-Metadata (title, type) is always fetched from [imdbapi.dev](https://imdbapi.dev).
-
-## Subtitle Sources
-
-- Movies: OpenSubtitles REST API
-- TV shows: feliratok.eu
+Metadata, streams, and subtitle sources are fetched via the [AniAPI](https://aniapi.kobosh.com) endpoint.
 
 ## Unmask
 
