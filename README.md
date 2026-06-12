@@ -1,47 +1,57 @@
 # imdbdownloader
 
-Downloads movies and TV shows by IMDB ID using yt-dlp and ffmpeg. Subtitles are fetched automatically from AniAPI.
+Downloads movies and TV shows by IMDb ID, Animetsu ID, Anikoto ID, or Miruro ID using yt-dlp and ffmpeg. Metadata, streams, and subtitle sources are fetched via the [AniAPI](https://aniapi.kobosh.com) endpoint.
+
+## Features
+
+- **Multi-threaded Bulk Downloads**: Download entire seasons or TV shows concurrently using high-performance, asynchronous workers.
+- **Embedded Subtitles**: Automatically download and soft-embed subtitle tracks directly into MP4 containers via FFmpeg.
+- **Automated Steganographic Unmasking**: Automatically detect and strip steganographic wrappers (like PNG or JPEG) from video downloads on the fly without any manual scripts needed.
 
 ## Requirements
 
-- A C++17 compiler (e.g. `g++` or `clang++`)
-- `libcurl`
-- `nlohmann-json` (already handled in source, or installed via package manager)
-- `yt-dlp` and `ffmpeg` in PATH
+- `rust` and `cargo` (Latest stable release)
+- `yt-dlp` and `ffmpeg` in your system `PATH`
 
 ### macOS
 
 ```bash
-brew install yt-dlp ffmpeg curl nlohmann-json
+brew install yt-dlp ffmpeg rustup
+rustup-init
 ```
 
 ### Linux (Debian/Ubuntu)
 
 ```bash
-sudo apt install build-essential libcurl4-openssl-dev nlohmann-json3-dev ffmpeg
+sudo apt install ffmpeg
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 pip install yt-dlp
 ```
 
 ## Setup & Build
 
-Build the project using `make`:
+Build the optimized release binary:
 
 ```bash
-make
+cargo build --release
 ```
 
-## Install to PATH
+The compiled binary will be placed at `./target/release/imdbdownloader`.
+
+## Installation
+
+To install `imdbdownloader` globally on your machine:
 
 ```bash
-sudo make install
+cargo install --path .
 ```
 
-This installs `imdbdownloader` to `/usr/local/bin/imdbdownloader` so you can run it from anywhere.
+This installs `imdbdownloader` into your Cargo bin folder (typically `~/.cargo/bin`), allowing you to run it from anywhere in your terminal.
 
 ## Usage
 
 ```bash
-imdbdownloader <IMDB_ID> [options]
+imdbdownloader <IMDB_OR_ANIME_ID> [options]
 ```
 
 **Options:**
@@ -54,6 +64,7 @@ imdbdownloader <IMDB_ID> [options]
 | `-s, --embed-subs` | Automatically download and embed subtitles as a soft subtitle track |
 | `-l, --sub-lang <lang>` | Preferred subtitle language (default: English) |
 | `-i, --imdb <id>` | IMDB ID of the show (used for subtitles) |
+| `--base-url <url>` | Override AniAPI base URL (default: `https://aniapi.kobosh.com`) |
 
 ## Examples
 
@@ -67,9 +78,9 @@ Download a movie with embedded subtitles:
 imdbdownloader tt5311514 --embed-subs
 ```
 
-Download a TV show (prompts for episode, season, or all download option):
+Download an anime with Miruro softsub stream:
 ```bash
-imdbdownloader tt0480489
+imdbdownloader miruro:21355:ssub --embed-subs
 ```
 
 Download with Japanese subtitles:
@@ -82,26 +93,6 @@ imdbdownloader tt0480489 --sub-lang Japanese
 - Movies are saved to `./<Title>.mp4` in the current directory.
 - TV Shows are saved to `./<Title>/Season_N/<Title>-SN-EN.mp4` for season or bulk downloads.
 - Subtitle files are saved alongside the video as `.srt` or `.vtt` unless `--embed-subs` is used to soft-embed them directly inside the mp4 container.
-
-## Stream & Metadata Sources
-
-Metadata, streams, and subtitle sources are fetched via the [AniAPI](https://aniapi.kobosh.com) endpoint.
-
-## Unmask
-
-When downloading videos from sites, using yt-dlp/ffmpeg, the file might be masked under a png file. Like this:
-
-```
-00000000: 8950 4e47 0d0a 1a0a 0000 000d 4948 4452  .PNG........IHDR
-00000010: 0000 0001 0000 0001 0806 0000 001f 15c4  ................
-00000020: 8900 0000 0173 5247 4200 aece 1ce9 0000  .....sRGB.......
-```
-
-To unmask it, you can use the unmask.py script:
-
-```bash
-python unmask.py -i <masked_file.png> -o <output_file.mp4>
-```
 
 ## License
 

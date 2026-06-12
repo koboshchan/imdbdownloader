@@ -1,5 +1,7 @@
 # Build output
 imdbdownloader
+/target/
+**/*.rs.bk
 
 # macOS
 .DS_Store
