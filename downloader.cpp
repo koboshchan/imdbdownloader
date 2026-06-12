@@ -534,7 +534,10 @@ void handleShow(const std::string& imdbId, const std::string& title, const json&
         for (auto it = epsData.begin(); it != epsData.end(); ++it) {
             seasons.push_back(it.key());
             int count = it.value().is_array() ? it.value().size() : it.value().get<int>();
-            std::cout << "  Season " << it.key() << " (" << count << " episodes)" << std::endl;
+        }
+        for (size_t i = 0; i < seasons.size(); ++i) {
+            int count = epsData[seasons[i]].is_array() ? epsData[seasons[i]].size() : epsData[seasons[i]].get<int>();
+            std::cout << "  " << (i + 1) << ". Season " << seasons[i] << " (" << count << " episodes)" << std::endl;
         }
 
         std::cout << "\nOptions:\n  1. Download one specific episode\n  2. Download one season\n  3. Download ALL episodes" << std::endl;
@@ -544,10 +547,16 @@ void handleShow(const std::string& imdbId, const std::string& title, const json&
         std::string cleanTitle = sanitizeFilename(title);
 
         if (mode == 1) {
-            std::string chosenSeason;
+            int seasonIdx;
             int chosenEp;
             std::cout << "Enter Season Number: ";
-            std::cin >> chosenSeason;
+            std::cin >> seasonIdx;
+            seasonIdx--;
+            if (seasonIdx < 0 || seasonIdx >= (int)seasons.size()) {
+                std::cerr << "Invalid season selection." << std::endl;
+                return;
+            }
+            std::string chosenSeason = seasons[seasonIdx];
             std::cout << "Enter Episode Number: ";
             std::cin >> chosenEp;
 
@@ -570,14 +579,16 @@ void handleShow(const std::string& imdbId, const std::string& title, const json&
                 std::cerr << "Primary source failed for that episode." << std::endl;
             }
         } else if (mode == 2) {
-            std::string chosenSeason;
+            int seasonIdx;
             std::cout << "Enter Season Number: ";
-            std::cin >> chosenSeason;
+            std::cin >> seasonIdx;
+            seasonIdx--; // convert to 0-indexed
 
-            if (!epsData.contains(chosenSeason)) {
-                std::cerr << "Season " << chosenSeason << " not found." << std::endl;
+            if (seasonIdx < 0 || seasonIdx >= (int)seasons.size()) {
+                std::cerr << "Invalid season selection." << std::endl;
                 return;
             }
+            std::string chosenSeason = seasons[seasonIdx];
 
             DownloadManager manager(g_config.threads);
             int epCount = epsData[chosenSeason].is_array() ? epsData[chosenSeason].size() : epsData[chosenSeason].get<int>();
@@ -647,15 +658,15 @@ void handleShow(const std::string& imdbId, const std::string& title, const json&
     std::cout << "\nFound TV Show: " << title << std::endl;
     std::cout << "[Info] AniAPI did not return episode metadata. Downloading a single episode only." << std::endl;
     std::string cleanTitle = sanitizeFilename(title);
-    std::string chosenSeason;
+    int seasonIdx;
     int chosenEp;
     std::cout << "Enter Season Number: ";
-    std::cin >> chosenSeason;
+    std::cin >> seasonIdx;
     std::cout << "Enter Episode Number: ";
     std::cin >> chosenEp;
 
     try {
-        json epRes = fetchAniApi("/download/show/" + imdbId + "/" + chosenSeason + "/" + std::to_string(chosenEp));
+        json epRes = fetchAniApi("/download/show/" + imdbId + "/" + std::to_string(seasonIdx) + "/" + std::to_string(chosenEp));
         std::string streamUrl = jval(epRes, "streamUrl", std::string(""));
         json headers = jval(epRes, "headers", json::object());
         std::string subUrl = jval(epRes, "sub", std::string(""));
@@ -663,11 +674,11 @@ void handleShow(const std::string& imdbId, const std::string& title, const json&
             std::cerr << "No stream found for that episode." << std::endl;
             return;
         }
-        std::string base = "./" + cleanTitle + "-S" + chosenSeason + "-E" + std::to_string(chosenEp);
+        std::string base = "./" + cleanTitle + "-S" + std::to_string(seasonIdx) + "-E" + std::to_string(chosenEp);
         std::string outputPath = base + ".mp4";
-        std::cout << "\nDownloading S" << chosenSeason << "E" << chosenEp << "..." << std::endl;
+        std::cout << "\nDownloading S" << std::to_string(seasonIdx) << "E" << chosenEp << "..." << std::endl;
         downloadStream(streamUrl, outputPath, headers, g_config.fragments);
-        handleSubtitles(imdbId, chosenSeason, chosenEp, outputPath, 0, nullptr, subUrl);
+        handleSubtitles(imdbId, std::to_string(seasonIdx), chosenEp, outputPath, 0, nullptr, subUrl);
         std::cout << "\nDownload complete." << std::endl;
     } catch (const std::exception& e) {
         std::cerr << "AniAPI episode download failed: " << e.what() << std::endl;
