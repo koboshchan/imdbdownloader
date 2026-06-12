@@ -54,7 +54,7 @@ def main():
     print(f"[+] Done! Stripped {written_fragments} junk image wrappers. Saved temporary file as {temporary_ts}")
     print(f"[*] Remuxing {temporary_ts} to {final_output} via FFmpeg...")
 
-    ffmpeg_command = ["ffmpeg", "-y", "-i", temporary_ts, "-c", "copy", final_output]
+    ffmpeg_command = ["ffmpeg", "-y", "-i", temporary_ts, "-c", "copy", "-bsf:a", "aac_adtstoasc", final_output]
 
     try:
         subprocess.run(ffmpeg_command, check=True)

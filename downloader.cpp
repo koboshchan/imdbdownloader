@@ -8,12 +8,14 @@
 #include <sstream>
 #include <iomanip>
 #include <filesystem>
+#include <algorithm>
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
 #include <sys/ioctl.h>
 #include <unistd.h>
 #include <regex>
 #include <fstream>
+#include <cstring>
 
 using json = nlohmann::json;
 namespace fs = std::filesystem;
@@ -27,9 +29,8 @@ struct Config {
     bool embedSubs = false;
     std::string subLang = "English";
     std::string subImdbId;
+    std::string baseUrl = "https://aniapi.kobosh.com";
 } g_config;
-
-const std::string ANIAPI_BASE = "https://aniapi.kobosh.com";
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
 
@@ -219,7 +220,7 @@ public:
 // ── AniAPI helpers ───────────────────────────────────────────────────────────
 
 json fetchAniApi(const std::string& pathname) {
-    std::string resp = fetchURL(ANIAPI_BASE + pathname, g_config.apiKey);
+    std::string resp = fetchURL(g_config.baseUrl + pathname, g_config.apiKey);
     try {
         return json::parse(stripToJSON(resp));
     } catch (const std::exception& e) {
@@ -289,7 +290,7 @@ void handleSubtitles(const std::string& imdbId, const std::string& season, int e
         if (!directSubUrl.empty()) {
             subUrl = directSubUrl;
             if (subUrl.find("http") != 0) {
-                subUrl = ANIAPI_BASE + subUrl;
+                subUrl = g_config.baseUrl + subUrl;
             }
 
             std::string ext = "vtt";
@@ -338,7 +339,7 @@ void handleSubtitles(const std::string& imdbId, const std::string& season, int e
 
             subUrl = jval(selectedSub, "url", std::string(""));
             if (subUrl.find("http") != 0) {
-                subUrl = ANIAPI_BASE + subUrl;
+                subUrl = g_config.baseUrl + subUrl;
             }
 
             log("[Subs] Downloading " + jval(selectedSub, "language", std::string("Unknown")) + " subtitle...");
@@ -396,6 +397,101 @@ void handleSubtitles(const std::string& imdbId, const std::string& season, int e
     }
 }
 
+// ── PNG/JPEG unmasker ──────────────────────────────────────────────────────
+
+bool isMaskedFile(const std::string& path) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) return false;
+    unsigned char header[4];
+    file.read(reinterpret_cast<char*>(header), 4);
+    if (!file) return false;
+    // PNG: \x89 PNG
+    if (header[0] == 0x89 && header[1] == 'P' && header[2] == 'N' && header[3] == 'G') return true;
+    // JPEG: \xFF\xD8\xFF
+    if (header[0] == 0xFF && header[1] == 0xD8 && header[2] == 0xFF) return true;
+    return false;
+}
+
+bool unmaskFile(const std::string& inputPath, const std::string& outputPath) {
+    // Read entire file
+    std::ifstream in(inputPath, std::ios::binary | std::ios::ate);
+    if (!in) return false;
+    std::streamsize size = in.tellg();
+    in.seekg(0, std::ios::beg);
+    std::vector<unsigned char> data(size);
+    if (!in.read(reinterpret_cast<char*>(data.data()), size)) return false;
+    in.close();
+
+    // Write raw TS data by scanning for stream entry points
+    std::string tmpPath = outputPath + ".tmp.ts";
+    std::ofstream tmp(tmpPath, std::ios::binary);
+    if (!tmp) return false;
+
+    size_t written = 0;
+    const unsigned char pngMagic[] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n'};
+    const unsigned char jpgMagic[] = {0xFF, 0xD8, 0xFF};
+    const size_t pngLen = 8, jpgLen = 3;
+
+    auto findMagic = [&](const unsigned char* magic, size_t mlen) -> std::vector<size_t> {
+        std::vector<size_t> pos;
+        for (size_t i = 0; i + mlen <= data.size(); ++i) {
+            if (std::memcmp(data.data() + i, magic, mlen) == 0) pos.push_back(i);
+        }
+        return pos;
+    };
+
+    // Collect all magic positions
+    std::vector<size_t> allPos = findMagic(pngMagic, pngLen);
+    auto jpgPos = findMagic(jpgMagic, jpgLen);
+    allPos.insert(allPos.end(), jpgPos.begin(), jpgPos.end());
+    std::sort(allPos.begin(), allPos.end());
+
+    // Regions between/after magic markers
+    size_t segmentStart = 0;
+    for (size_t magicPos : allPos) {
+        // Determine which magic is at this position
+        size_t magicLen = 0;
+        if (magicPos + pngLen <= data.size() && std::memcmp(data.data() + magicPos, pngMagic, pngLen) == 0) magicLen = pngLen;
+        else if (magicPos + jpgLen <= data.size() && std::memcmp(data.data() + magicPos, jpgMagic, jpgLen) == 0) magicLen = jpgLen;
+        if (magicLen == 0) continue;
+
+        // Write segment before this magic (if any)
+        if (magicPos > segmentStart) {
+            tmp.write(reinterpret_cast<char*>(data.data() + segmentStart), magicPos - segmentStart);
+        }
+
+        // Find actual video start after the magic header: ID3 tag or MPEG-TS sync byte (0x47)
+        size_t searchStart = magicPos + magicLen;
+        size_t videoStart = std::string::npos;
+        for (size_t j = searchStart; j + 3 <= data.size(); ++j) {
+            if (data[j] == 'I' && data[j+1] == 'D' && data[j+2] == '3') { videoStart = j; break; }
+            if (data[j] == 0x47) { videoStart = j; break; }
+        }
+        if (videoStart != std::string::npos) {
+            tmp.write(reinterpret_cast<char*>(data.data() + videoStart), data.size() - videoStart);
+            written++;
+        }
+        break; // We only need the first valid region after the magic header
+    }
+
+    tmp.close();
+
+    if (written == 0) {
+        // No magic markers found or no video stream — copy as-is
+        std::ifstream srcCopy(inputPath, std::ios::binary);
+        std::ofstream dstCopy(outputPath, std::ios::binary);
+        dstCopy << srcCopy.rdbuf();
+        fs::remove(tmpPath);
+        return true;
+    }
+
+    // Remux with ffmpeg
+    std::string cmd = "ffmpeg -y -i \"" + tmpPath + "\" -c copy -bsf:a aac_adtstoasc -movflags +faststart \"" + outputPath + "\" > /dev/null 2>&1";
+    int res = std::system(cmd.c_str());
+    fs::remove(tmpPath);
+    return res == 0;
+}
+
 // ── Video downloader ──────────────────────────────────────────────────────────
 
 void downloadStream(const std::string& m3u8Url, const std::string& outputPath, const json& extraHeaders, 
@@ -447,7 +543,30 @@ void downloadStream(const std::string& m3u8Url, const std::string& outputPath, c
         }
 
         int result = pclose(pipe);
-        if (result == 0) return;
+        if (result == 0) {
+            // Auto-detect and unmask PNG/JPEG-wrapped downloads
+            if (isMaskedFile(outputPath)) {
+                std::string unmaskedPath = outputPath + ".unmasked.mp4";
+                std::string statusMsg = "Unmasking...";
+                if (manager) {
+                    manager->updateWorker(workerId, "Unmasking", 100, nullptr, "Removing image wrapper...");
+                } else {
+                    std::cout << "\nDetected image wrapper, stripping..." << std::flush;
+                }
+                if (unmaskFile(outputPath, unmaskedPath)) {
+                    fs::remove(outputPath);
+                    fs::rename(unmaskedPath, outputPath);
+                    if (manager) {
+                        manager->updateWorker(workerId, "Downloading", 100, nullptr, "Unmasked successfully");
+                    } else {
+                        std::cout << " done." << std::endl;
+                    }
+                } else {
+                    if (fs::exists(unmaskedPath)) fs::remove(unmaskedPath);
+                }
+            }
+            return;
+        }
 
         retries++;
         if (retries > maxRetries) throw std::runtime_error("yt-dlp failed with code " + std::to_string(result));
@@ -711,7 +830,8 @@ void printHelp() {
               << "  -f, --concurrent-fragments <n>   Number of concurrent fragments per download [default: 8]\n"
               << "  -s, --embed-subs                 Automatically download and embed subtitles\n"
               << "  -l, --sub-lang <lang>            Preferred subtitle language [default: English]\n"
-              << "  -i, --imdb <id>                  IMDB ID of the show (used for subtitles)\n\n"
+              << "  -i, --imdb <id>                  IMDB ID of the show (used for subtitles)\n"
+              << "  --base-url <url>                 Override API base URL [default: https://aniapi.kobosh.com]\n\n"
               << "Examples:\n"
               << "  $ imdbdownloader tt0480489 --embed-subs\n"
               << "  $ imdbdownloader tt0480489 --key YOUR_API_KEY --embed-subs --sub-lang Hungarian\n";
@@ -729,13 +849,15 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    const char* envToken = std::getenv("ANIAPI_TOKEN");
+            const char* envToken = std::getenv("ANIAPI_TOKEN");
     if (envToken) g_config.apiKey = trim(envToken);
 
     for (int i = 2; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--key" && i + 1 < argc) {
             g_config.apiKey = trim(argv[++i]);
+        } else if ((arg == "--base-url") && i + 1 < argc) {
+            g_config.baseUrl = trim(argv[++i]);
         } else if ((arg == "-t" || arg == "--threads") && i + 1 < argc) {
             g_config.threads = std::stoi(argv[++i]);
         } else if ((arg == "-f" || arg == "--concurrent-fragments") && i + 1 < argc) {
