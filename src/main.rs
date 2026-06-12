@@ -38,6 +38,9 @@ struct Args {
 
     #[arg(long, default_value = "https://aniapi.kobosh.com", help = "Override API base URL")]
     base_url: String,
+
+    #[arg(long, help = "Only check if the video file exists, and download/embed subtitles for it")]
+    sub_only: bool,
 }
 
 // ── Global Config ───────────────────────────────────────────────────────────
@@ -50,6 +53,7 @@ struct Config {
     sub_lang: String,
     sub_imdb_id: String,
     base_url: String,
+    sub_only: bool,
 }
 
 // ── Structures ──────────────────────────────────────────────────────────────
@@ -379,7 +383,7 @@ fn handle_subtitles(
     direct_sub_url: &str,
     config: &Config,
 ) {
-    if !config.embed_subs {
+    if !config.embed_subs && !config.sub_only {
         return;
     }
 
@@ -697,11 +701,31 @@ fn download_worker(worker_id: usize, manager_arc: Arc<Mutex<DownloadManager>>, c
                 let headers = ep_res.get("headers").cloned().unwrap_or(serde_json::json!({}));
                 task.sub_url = ep_res.get("sub").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
-                if m3u8.is_empty() {
+                let output_path = format!("{}.mp4", task.file_name_base);
+
+                if config.sub_only {
+                    if Path::new(&output_path).exists() {
+                        println!("[Subs] Found file, embedding subtitles for S{}E{}...", task.season, task.episode);
+                        handle_subtitles(
+                            &task.imdb_id,
+                            &task.season,
+                            task.episode,
+                            &output_path,
+                            worker_id,
+                            &Some(manager_arc.clone()),
+                            &task.sub_url,
+                            &config,
+                        );
+                        task.downloaded = true;
+                    } else {
+                        eprintln!("Error: File is missing at {}", output_path);
+                        failed = true;
+                        err_msg = "File is missing".to_string();
+                    }
+                } else if m3u8.is_empty() {
                     failed = true;
                 } else {
                     let _ = fs::create_dir_all(&task.base_dir);
-                    let output_path = format!("{}.mp4", task.file_name_base);
 
                     match download_stream(&m3u8, &output_path, &headers, config.fragments, worker_id, &Some(manager_arc.clone())) {
                         Ok(_) => {
@@ -796,6 +820,17 @@ fn handle_movie(imdb_id: &str, title: &str, config: &Config) {
     let clean_title = sanitize_filename(title);
     println!("\nFound Movie: {}", title);
     let output_path = format!("./{}.mp4", clean_title);
+
+    if config.sub_only {
+        if Path::new(&output_path).exists() {
+            println!("[Subs] Found file, embedding subtitles...");
+            handle_subtitles(imdb_id, "", 0, &output_path, 0, &None, &sub_url, config);
+        } else {
+            eprintln!("Error: File is missing at {}", output_path);
+        }
+        return;
+    }
+
     println!("Downloading to {}...", output_path);
 
     if let Err(e) = download_stream(&stream_url, &output_path, &headers, config.fragments, 0, &None) {
@@ -854,7 +889,6 @@ fn handle_show(imdb_id: &str, title: &str, eps_data: &Value, config: Arc<Config>
             io::stdin().read_line(&mut e_in).unwrap();
             let ep_num = e_in.trim().parse::<usize>().unwrap_or(0);
 
-            println!("\nDownloading S{}E{}...", season_num, ep_num);
             match fetch_ani_api(&format!("/download/show/{}/{}/{}", imdb_id, season_num, ep_num), &config) {
                 Ok(ep_res) => {
                     let stream_url = ep_res.get("streamUrl").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -864,11 +898,21 @@ fn handle_show(imdb_id: &str, title: &str, eps_data: &Value, config: Arc<Config>
                     if !stream_url.is_empty() {
                         let base = format!("./{}-S{}-E{}", clean_title, season_num, ep_num);
                         let output_path = format!("{}.mp4", base);
-                        if let Err(e) = download_stream(&stream_url, &output_path, &headers, config.fragments, 0, &None) {
-                            eprintln!("Download failed: {}", e);
+                        if config.sub_only {
+                            if Path::new(&output_path).exists() {
+                                println!("[Subs] Found file, embedding subtitles for S{}E{}...", season_num, ep_num);
+                                handle_subtitles(imdb_id, season_num, ep_num, &output_path, 0, &None, &sub_url, &config);
+                            } else {
+                                eprintln!("Error: File is missing at {}", output_path);
+                            }
                         } else {
-                            handle_subtitles(imdb_id, season_num, ep_num, &output_path, 0, &None, &sub_url, &config);
-                            println!("\nDownload complete.");
+                            println!("\nDownloading S{}E{}...", season_num, ep_num);
+                            if let Err(e) = download_stream(&stream_url, &output_path, &headers, config.fragments, 0, &None) {
+                                eprintln!("Download failed: {}", e);
+                            } else {
+                                handle_subtitles(imdb_id, season_num, ep_num, &output_path, 0, &None, &sub_url, &config);
+                                println!("\nDownload complete.");
+                            }
                         }
                     } else {
                         eprintln!("No stream found via primary source.");
@@ -930,12 +974,17 @@ fn handle_show(imdb_id: &str, title: &str, eps_data: &Value, config: Arc<Config>
                 is_bulk: false,
             }));
 
-            println!("\nStarting bulk download of Season {} ({} episodes) with {} threads...", chosen_season, ep_count, config.threads);
-            manager.lock().unwrap().is_bulk = true;
-            for _ in 0..(config.threads * 2 + 2) {
-                println!();
+            if config.sub_only {
+                println!("\nChecking and embedding subtitles for Season {} ({} episodes)...", chosen_season, ep_count);
+                manager.lock().unwrap().is_bulk = false;
+            } else {
+                println!("\nStarting bulk download of Season {} ({} episodes) with {} threads...", chosen_season, ep_count, config.threads);
+                manager.lock().unwrap().is_bulk = true;
+                for _ in 0..(config.threads * 2 + 2) {
+                    println!();
+                }
+                render(&manager);
             }
-            render(&manager);
 
             let mut thread_handles = Vec::new();
             for i in 0..config.threads {
@@ -952,9 +1001,17 @@ fn handle_show(imdb_id: &str, title: &str, eps_data: &Value, config: Arc<Config>
 
             let failed_count = manager.lock().unwrap().tasks.iter().filter(|t| t.failed).count();
             if failed_count > 0 {
-                println!("\nNot all eps are downloaded and they need to run the command again");
+                if config.sub_only {
+                    println!("\nSubtitles processing finished. {} episodes had errors or missing files.", failed_count);
+                } else {
+                    println!("\nNot all eps are downloaded and they need to run the command again");
+                }
             } else {
-                println!("\nAll downloads completed.");
+                if config.sub_only {
+                    println!("\nAll subtitles processed successfully.");
+                } else {
+                    println!("\nAll downloads completed.");
+                }
             }
         } else if mode == 3 {
             let mut tasks = Vec::new();
@@ -998,12 +1055,17 @@ fn handle_show(imdb_id: &str, title: &str, eps_data: &Value, config: Arc<Config>
                 is_bulk: false,
             }));
 
-            println!("\nStarting bulk download ({} episodes) with {} threads...", manager.lock().unwrap().tasks.len(), config.threads);
-            manager.lock().unwrap().is_bulk = true;
-            for _ in 0..(config.threads * 2 + 2) {
-                println!();
+            if config.sub_only {
+                println!("\nChecking and embedding subtitles for all episodes ({} episodes)...", manager.lock().unwrap().tasks.len());
+                manager.lock().unwrap().is_bulk = false;
+            } else {
+                println!("\nStarting bulk download ({} episodes) with {} threads...", manager.lock().unwrap().tasks.len(), config.threads);
+                manager.lock().unwrap().is_bulk = true;
+                for _ in 0..(config.threads * 2 + 2) {
+                    println!();
+                }
+                render(&manager);
             }
-            render(&manager);
 
             let mut thread_handles = Vec::new();
             for i in 0..config.threads {
@@ -1020,9 +1082,17 @@ fn handle_show(imdb_id: &str, title: &str, eps_data: &Value, config: Arc<Config>
 
             let failed_count = manager.lock().unwrap().tasks.iter().filter(|t| t.failed).count();
             if failed_count > 0 {
-                println!("\nNot all eps are downloaded and they need to run the command again");
+                if config.sub_only {
+                    println!("\nSubtitles processing finished. {} episodes had errors or missing files.", failed_count);
+                } else {
+                    println!("\nNot all eps are downloaded and they need to run the command again");
+                }
             } else {
-                println!("\nAll downloads completed.");
+                if config.sub_only {
+                    println!("\nAll subtitles processed successfully.");
+                } else {
+                    println!("\nAll downloads completed.");
+                }
             }
         } else {
             eprintln!("Invalid option.");
@@ -1060,6 +1130,17 @@ fn handle_show(imdb_id: &str, title: &str, eps_data: &Value, config: Arc<Config>
 
             let base = format!("./{}-S{}-E{}", clean_title, season_idx, chosen_ep);
             let output_path = format!("{}.mp4", base);
+
+            if config.sub_only {
+                if Path::new(&output_path).exists() {
+                    println!("[Subs] Found file, embedding subtitles for S{}E{}...", season_idx, chosen_ep);
+                    handle_subtitles(imdb_id, season_idx, chosen_ep, &output_path, 0, &None, &sub_url, &config);
+                } else {
+                    eprintln!("Error: File is missing at {}", output_path);
+                }
+                return;
+            }
+
             println!("\nDownloading S{}E{}...", season_idx, chosen_ep);
 
             if let Err(e) = download_stream(&stream_url, &output_path, &headers, config.fragments, 0, &None) {
@@ -1077,7 +1158,7 @@ fn handle_show(imdb_id: &str, title: &str, eps_data: &Value, config: Arc<Config>
 
 // ── Dependency Check ──────────────────────────────────────────────────────────
 
-fn check_dependencies() -> bool {
+fn check_dependencies(sub_only: bool) -> bool {
     let check_cmd = |cmd: &str| -> bool {
         Command::new("sh")
             .arg("-c")
@@ -1087,7 +1168,7 @@ fn check_dependencies() -> bool {
             .unwrap_or(false)
     };
 
-    if !check_cmd("yt-dlp") {
+    if !sub_only && !check_cmd("yt-dlp") {
         eprintln!("Missing required dependencies: yt-dlp");
         return false;
     }
@@ -1116,7 +1197,7 @@ fn main() {
         std::process::exit(1);
     }
 
-    if !check_dependencies() {
+    if !check_dependencies(args.sub_only) {
         std::process::exit(1);
     }
 
@@ -1135,6 +1216,7 @@ fn main() {
         sub_lang: args.sub_lang,
         sub_imdb_id,
         base_url: args.base_url,
+        sub_only: args.sub_only,
     });
 
     println!("Analyzing IMDB Media Signature...");
