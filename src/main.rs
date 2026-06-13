@@ -41,6 +41,9 @@ struct Args {
 
     #[arg(long, help = "Only check if the video file exists, and download/embed subtitles for it")]
     sub_only: bool,
+
+    #[arg(long, help = "Skip downloading if the output file already exists")]
+    skip_existing: bool,
 }
 
 // ── Global Config ───────────────────────────────────────────────────────────
@@ -54,6 +57,7 @@ struct Config {
     sub_imdb_id: String,
     base_url: String,
     sub_only: bool,
+    skip_existing: bool,
 }
 
 // ── Structures ──────────────────────────────────────────────────────────────
@@ -706,40 +710,20 @@ fn download_worker(worker_id: usize, manager_arc: Arc<Mutex<DownloadManager>>, c
         let mut failed = false;
         let mut err_msg = "No stream URL".to_string();
 
-        match fetch_ani_api(&format!("/download/show/{}/{}/{}", task.imdb_id, task.season, task.episode), &config) {
-            Ok(ep_res) => {
-                let m3u8 = ep_res.get("streamUrl").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let headers = ep_res.get("headers").cloned().unwrap_or(serde_json::json!({}));
-                task.sub_url = ep_res.get("sub").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let output_path = format!("{}.mp4", task.file_name_base);
 
-                let output_path = format!("{}.mp4", task.file_name_base);
+        if config.skip_existing && Path::new(&output_path).exists() {
+            task.downloaded = true;
+        } else {
+            match fetch_ani_api(&format!("/download/show/{}/{}/{}", task.imdb_id, task.season, task.episode), &config) {
+                Ok(ep_res) => {
+                    let m3u8 = ep_res.get("streamUrl").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let headers = ep_res.get("headers").cloned().unwrap_or(serde_json::json!({}));
+                    task.sub_url = ep_res.get("sub").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
-                if config.sub_only {
-                    if Path::new(&output_path).exists() {
-                        println!("[Subs] Found file, embedding subtitles for S{}E{}...", task.season, task.episode);
-                        handle_subtitles(
-                            &task.imdb_id,
-                            &task.season,
-                            task.episode,
-                            &output_path,
-                            worker_id,
-                            &Some(manager_arc.clone()),
-                            &task.sub_url,
-                            &config,
-                        );
-                        task.downloaded = true;
-                    } else {
-                        eprintln!("Error: File is missing at {}", output_path);
-                        failed = true;
-                        err_msg = "File is missing".to_string();
-                    }
-                } else if m3u8.is_empty() {
-                    failed = true;
-                } else {
-                    let _ = fs::create_dir_all(&task.base_dir);
-
-                    match download_stream(&m3u8, &output_path, &headers, config.fragments, worker_id, &Some(manager_arc.clone())) {
-                        Ok(_) => {
+                    if config.sub_only {
+                        if Path::new(&output_path).exists() {
+                            println!("[Subs] Found file, embedding subtitles for S{}E{}...", task.season, task.episode);
                             handle_subtitles(
                                 &task.imdb_id,
                                 &task.season,
@@ -751,17 +735,41 @@ fn download_worker(worker_id: usize, manager_arc: Arc<Mutex<DownloadManager>>, c
                                 &config,
                             );
                             task.downloaded = true;
-                        }
-                        Err(e) => {
+                        } else {
+                            eprintln!("Error: File is missing at {}", output_path);
                             failed = true;
-                            err_msg = e;
+                            err_msg = "File is missing".to_string();
+                        }
+                    } else if m3u8.is_empty() {
+                        failed = true;
+                    } else {
+                        let _ = fs::create_dir_all(&task.base_dir);
+
+                        match download_stream(&m3u8, &output_path, &headers, config.fragments, worker_id, &Some(manager_arc.clone())) {
+                            Ok(_) => {
+                                handle_subtitles(
+                                    &task.imdb_id,
+                                    &task.season,
+                                    task.episode,
+                                    &output_path,
+                                    worker_id,
+                                    &Some(manager_arc.clone()),
+                                    &task.sub_url,
+                                    &config,
+                                );
+                                task.downloaded = true;
+                            }
+                            Err(e) => {
+                                failed = true;
+                                err_msg = e;
+                            }
                         }
                     }
                 }
-            }
-            Err(e) => {
-                failed = true;
-                err_msg = e;
+                Err(e) => {
+                    failed = true;
+                    err_msg = e;
+                }
             }
         }
 
@@ -811,6 +819,14 @@ fn download_worker(worker_id: usize, manager_arc: Arc<Mutex<DownloadManager>>, c
 // ── Movie Mode ───────────────────────────────────────────────────────────────
 
 fn handle_movie(imdb_id: &str, title: &str, config: &Config) {
+    let clean_title = sanitize_filename(title);
+    let output_path = format!("./{}.mp4", clean_title);
+
+    if config.skip_existing && Path::new(&output_path).exists() {
+        println!("File already exists at {}, skipping download.", output_path);
+        return;
+    }
+
     let movie_data = match fetch_ani_api(&format!("/download/movie/{}", imdb_id), config) {
         Ok(d) => d,
         Err(_) => {
@@ -828,9 +844,7 @@ fn handle_movie(imdb_id: &str, title: &str, config: &Config) {
         return;
     }
 
-    let clean_title = sanitize_filename(title);
     println!("\nFound Movie: {}", title);
-    let output_path = format!("./{}.mp4", clean_title);
 
     if config.sub_only {
         if Path::new(&output_path).exists() {
@@ -900,6 +914,14 @@ fn handle_show(imdb_id: &str, title: &str, eps_data: &Value, config: Arc<Config>
             io::stdin().read_line(&mut e_in).unwrap();
             let ep_num = e_in.trim().parse::<usize>().unwrap_or(0);
 
+            let base = format!("./{}-S{}-E{}", clean_title, season_num, ep_num);
+            let output_path = format!("{}.mp4", base);
+
+            if config.skip_existing && Path::new(&output_path).exists() {
+                println!("File already exists at {}, skipping download.", output_path);
+                return;
+            }
+
             match fetch_ani_api(&format!("/download/show/{}/{}/{}", imdb_id, season_num, ep_num), &config) {
                 Ok(ep_res) => {
                     let stream_url = ep_res.get("streamUrl").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -907,8 +929,6 @@ fn handle_show(imdb_id: &str, title: &str, eps_data: &Value, config: Arc<Config>
                     let sub_url = ep_res.get("sub").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
                     if !stream_url.is_empty() {
-                        let base = format!("./{}-S{}-E{}", clean_title, season_num, ep_num);
-                        let output_path = format!("{}.mp4", base);
                         if config.sub_only {
                             if Path::new(&output_path).exists() {
                                 println!("[Subs] Found file, embedding subtitles for S{}E{}...", season_num, ep_num);
@@ -1130,6 +1150,14 @@ fn handle_show(imdb_id: &str, title: &str, eps_data: &Value, config: Arc<Config>
 
     let clean_title = sanitize_filename(title);
 
+    let base = format!("./{}-S{}-E{}", clean_title, season_idx, chosen_ep);
+    let output_path = format!("{}.mp4", base);
+
+    if config.skip_existing && Path::new(&output_path).exists() {
+        println!("File already exists at {}, skipping download.", output_path);
+        return;
+    }
+
     match fetch_ani_api(&format!("/download/show/{}/{}/{}", imdb_id, season_idx, chosen_ep), &config) {
         Ok(ep_res) => {
             let stream_url = ep_res.get("streamUrl").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -1140,9 +1168,6 @@ fn handle_show(imdb_id: &str, title: &str, eps_data: &Value, config: Arc<Config>
                 eprintln!("No stream found for that episode.");
                 return;
             }
-
-            let base = format!("./{}-S{}-E{}", clean_title, season_idx, chosen_ep);
-            let output_path = format!("{}.mp4", base);
 
             if config.sub_only {
                 if Path::new(&output_path).exists() {
@@ -1230,6 +1255,7 @@ fn main() {
         sub_imdb_id,
         base_url: args.base_url,
         sub_only: args.sub_only,
+        skip_existing: args.skip_existing,
     });
 
     println!("Analyzing IMDB Media Signature...");
