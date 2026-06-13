@@ -68,6 +68,7 @@ struct Task {
     sub_url: String,
     downloaded: bool,
     failed: bool,
+    failure_printed: bool,
     claimed_by: usize,
 }
 
@@ -300,19 +301,24 @@ fn fetch_imdb_metadata(imdb_id: &str, config: &Config) -> Metadata {
 // ── Rendering Progress UI ────────────────────────────────────────────────────
 
 fn render(manager_arc: &Arc<Mutex<DownloadManager>>) {
-    let manager = manager_arc.lock().unwrap();
+    let mut manager = manager_arc.lock().unwrap();
     if !manager.is_bulk {
         return;
     }
 
     let mut completed = 0;
     let mut failed = 0;
-    for t in &manager.tasks {
+    let mut failed_to_print = Vec::new();
+    for t in &mut manager.tasks {
         if t.downloaded {
             completed += 1;
         }
         if t.failed {
             failed += 1;
+            if !t.failure_printed {
+                t.failure_printed = true;
+                failed_to_print.push(format!("S{}E{} Failed to download.", t.season, t.episode));
+            }
         }
     }
     let total = manager.tasks.len();
@@ -341,6 +347,11 @@ fn render(manager_arc: &Arc<Mutex<DownloadManager>>) {
 
     // Move cursor up and to column 1
     print!("\x1b[{}A\x1b[G", lines_to_move);
+
+    // Print failed messages
+    for msg in &failed_to_print {
+        print!("\x1b[K{}\n", msg);
+    }
 
     // Render Total Progress
     print!("\x1b[K{}{}{}\n\x1b[K\n", prefix, bar, status_text);
@@ -953,6 +964,7 @@ fn handle_show(imdb_id: &str, title: &str, eps_data: &Value, config: Arc<Config>
                     sub_url: "".to_string(),
                     downloaded: false,
                     failed: false,
+                    failure_printed: false,
                     claimed_by: usize::MAX,
                 });
             }
@@ -1033,6 +1045,7 @@ fn handle_show(imdb_id: &str, title: &str, eps_data: &Value, config: Arc<Config>
                         sub_url: "".to_string(),
                         downloaded: false,
                         failed: false,
+                        failure_printed: false,
                         claimed_by: usize::MAX,
                     });
                 }
