@@ -4,6 +4,7 @@ use serde_json::Value;
 #[derive(Clone, Debug)]
 pub struct Task {
     pub season: String,
+    pub stream_season: String,
     pub episode: usize,
     pub base_dir: String,
     pub file_name_base: String,

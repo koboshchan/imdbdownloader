@@ -1,11 +1,12 @@
 use std::sync::{Arc, Mutex};
 use std::fs;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Write, Read};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 use regex::Regex;
 use serde_json::Value;
+use libc::{termios, tcgetattr, tcsetattr, ECHO, ICANON, TCSANOW, STDIN_FILENO, fcntl, F_GETFL, F_SETFL, O_NONBLOCK};
 
 use crate::config::Config;
 use crate::types::{Task, WorkerStatus, DownloadManager};
@@ -14,6 +15,315 @@ use crate::api::{fetch_ani_api, sanitize_filename};
 use crate::unmask::{is_masked_file, unmask_file};
 use crate::subtitles::handle_subtitles;
 use crate::ram::{spawn_command_with_inherited_fds, process_download_in_ram};
+
+struct RawMode {
+    orig: termios,
+}
+
+impl RawMode {
+    fn enable() -> io::Result<Self> {
+        unsafe {
+            let mut orig = std::mem::zeroed();
+            if tcgetattr(STDIN_FILENO, &mut orig) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let mut raw = orig;
+            raw.c_lflag &= !(ECHO | ICANON);
+            if tcsetattr(STDIN_FILENO, TCSANOW, &raw) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(RawMode { orig })
+        }
+    }
+}
+
+impl Drop for RawMode {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = tcsetattr(STDIN_FILENO, TCSANOW, &self.orig);
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Key {
+    Up,
+    Down,
+    Enter,
+    Esc,
+    Rename,
+    Toggle,
+    Other,
+}
+
+fn read_key() -> Key {
+    let mut buf = [0; 1];
+    let mut stdin = io::stdin();
+    if stdin.read_exact(&mut buf).is_err() {
+        return Key::Other;
+    }
+    if buf[0] == 10 || buf[0] == 13 {
+        return Key::Enter;
+    }
+    if buf[0] == 114 || buf[0] == 82 { // 'r' or 'R'
+        return Key::Rename;
+    }
+    if buf[0] == 120 || buf[0] == 88 { // 'x' or 'X'
+        return Key::Toggle;
+    }
+    if buf[0] == 27 {
+        // Esc or start of escape sequence.
+        unsafe {
+            let fd = STDIN_FILENO;
+            let flags = fcntl(fd, F_GETFL, 0);
+            fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+            
+            let mut next_bytes = [0; 2];
+            std::thread::sleep(Duration::from_millis(10));
+            let read_res = stdin.read(&mut next_bytes);
+            
+            fcntl(fd, F_SETFL, flags);
+            
+            if let Ok(n) = read_res {
+                if n == 2 && next_bytes[0] == 91 {
+                    if next_bytes[1] == 65 {
+                        return Key::Up;
+                    } else if next_bytes[1] == 66 {
+                        return Key::Down;
+                    }
+                }
+            }
+        }
+        return Key::Esc;
+    }
+    Key::Other
+}
+
+fn render_interactive_list(seasons: &[(String, String, usize, bool)], cursor: usize, grabbed: Option<usize>, initial: bool) {
+    if !initial {
+        // Move up to the start of rendering
+        let lines_to_move = seasons.len() + 2; // list + header + empty line
+        print!("\x1b[{}A\x1b[G", lines_to_move);
+    }
+
+    // Print Header
+    if grabbed.is_some() {
+        print!("\x1b[K== MOVING SEASON == Use Up/Down to move, Esc/Enter to place/save\n");
+    } else {
+        print!("\x1b[K== REORDER SEASONS == Use Up/Down to select, Enter to grab, 'r' to rename, 'x' to toggle skip, Esc to finish\n");
+    }
+
+    for (i, (orig_s, new_s, count, enabled)) in seasons.iter().enumerate() {
+        let cursor_str = if Some(i) == grabbed {
+            " ->"
+        } else if i == cursor {
+            " * "
+        } else {
+            "   "
+        };
+
+        let status_str = if *enabled { "[x]" } else { "[ ] [SKIPPED]" };
+
+        if orig_s == new_s {
+            print!("\x1b[K{} {} Season {} ({} episodes)\n", cursor_str, status_str, new_s, count);
+        } else {
+            print!("\x1b[K{} {} Season {} [mapped from original Season {}] ({} episodes)\n", cursor_str, status_str, new_s, orig_s, count);
+        }
+    }
+    print!("\x1b[K\n");
+    let _ = io::stdout().flush();
+}
+
+fn interactive_reorder_loop(seasons: &mut Vec<(String, String, usize, bool)>) {
+    if seasons.is_empty() {
+        return;
+    }
+
+    // Print initial empty lines so that when we move cursor up, we don't overwrite unrelated console text
+    for _ in 0..(seasons.len() + 2) {
+        println!();
+    }
+
+    let mut cursor = 0;
+    let mut grabbed: Option<usize> = None;
+
+    render_interactive_list(seasons, cursor, grabbed, true);
+
+    let mut raw_guard = RawMode::enable().ok();
+
+    loop {
+        let key = read_key();
+        match key {
+            Key::Up => {
+                if let Some(g) = grabbed {
+                    if g > 0 {
+                        seasons.swap(g, g - 1);
+                        grabbed = Some(g - 1);
+                        cursor = g - 1;
+                    }
+                } else {
+                    if cursor > 0 {
+                        cursor -= 1;
+                    }
+                }
+            }
+            Key::Down => {
+                if let Some(g) = grabbed {
+                    if g < seasons.len() - 1 {
+                        seasons.swap(g, g + 1);
+                        grabbed = Some(g + 1);
+                        cursor = g + 1;
+                    }
+                } else {
+                    if cursor < seasons.len() - 1 {
+                        cursor += 1;
+                    }
+                }
+            }
+            Key::Enter => {
+                if grabbed.is_some() {
+                    grabbed = None;
+                } else {
+                    grabbed = Some(cursor);
+                }
+            }
+            Key::Esc => {
+                if grabbed.is_some() {
+                    grabbed = None;
+                } else {
+                    break;
+                }
+            }
+            Key::Rename => {
+                if grabbed.is_none() {
+                    // Temporarily disable raw mode
+                    raw_guard.take();
+
+                    // We are at the end of the printed list, print prompt
+                    let (orig_s, current_val, count, _) = &seasons[cursor];
+                    print!("Enter new season number for Season {} (current: {}) [{} eps]: ", orig_s, current_val, count);
+                    let _ = io::stdout().flush();
+
+                    let mut val_in = String::new();
+                    if io::stdin().read_line(&mut val_in).is_ok() {
+                        let val_trimmed = val_in.trim().to_string();
+                        if !val_trimmed.is_empty() {
+                            seasons[cursor].1 = val_trimmed;
+                        }
+                    }
+
+                    // Clear the prompt line we just printed
+                    print!("\x1b[1A\x1b[K");
+                    let _ = io::stdout().flush();
+
+                    // Re-enable raw mode
+                    raw_guard = RawMode::enable().ok();
+                }
+            }
+            Key::Toggle => {
+                if grabbed.is_none() {
+                    seasons[cursor].3 = !seasons[cursor].3;
+                }
+            }
+            Key::Other => {}
+        }
+        render_interactive_list(seasons, cursor, grabbed, false);
+    }
+
+    drop(raw_guard);
+}
+
+fn render_selection_list(title: &str, items: &[String], cursor: usize, initial: bool) {
+    if !initial {
+        let lines_to_move = items.len() + 2; // items + header + empty line
+        print!("\x1b[{}A\x1b[G", lines_to_move);
+    }
+    print!("\x1b[K== {} == Use Up/Down to select, Enter to choose, Esc to cancel\n", title);
+    for (i, item) in items.iter().enumerate() {
+        let cursor_str = if i == cursor { " * " } else { "   " };
+        print!("\x1b[K{}{}\n", cursor_str, item);
+    }
+    print!("\x1b[K\n");
+    let _ = io::stdout().flush();
+}
+
+fn interactive_select_season(seasons: &[(String, String, usize, bool)]) -> Option<usize> {
+    if seasons.is_empty() {
+        return None;
+    }
+
+    let items: Vec<String> = seasons.iter().map(|(orig_s, new_s, count, enabled)| {
+        let status = if *enabled { "[x]" } else { "[ ] [SKIPPED]" };
+        if orig_s == new_s {
+            format!("{} Season {} ({} episodes)", status, new_s, count)
+        } else {
+            format!("{} Season {} [mapped from Season {}] ({} episodes)", status, new_s, orig_s, count)
+        }
+    }).collect();
+
+    for _ in 0..(items.len() + 2) {
+        println!();
+    }
+
+    let mut cursor = 0;
+    render_selection_list("SELECT SEASON", &items, cursor, true);
+
+    let _raw_guard = RawMode::enable().ok();
+    loop {
+        match read_key() {
+            Key::Up => {
+                if cursor > 0 { cursor -= 1; }
+            }
+            Key::Down => {
+                if cursor < items.len() - 1 { cursor += 1; }
+            }
+            Key::Enter => {
+                return Some(cursor);
+            }
+            Key::Esc => {
+                return None;
+            }
+            _ => {}
+        }
+        render_selection_list("SELECT SEASON", &items, cursor, false);
+    }
+}
+
+fn interactive_select_episode(season_name: &str, ep_count: usize) -> Option<usize> {
+    if ep_count == 0 {
+        return None;
+    }
+
+    let items: Vec<String> = (1..=ep_count).map(|ep| format!("Episode {}", ep)).collect();
+
+    for _ in 0..(items.len() + 2) {
+        println!();
+    }
+
+    let mut cursor = 0;
+    let title = format!("SELECT EPISODE (Season {})", season_name);
+    render_selection_list(&title, &items, cursor, true);
+
+    let _raw_guard = RawMode::enable().ok();
+    loop {
+        match read_key() {
+            Key::Up => {
+                if cursor > 0 { cursor -= 1; }
+            }
+            Key::Down => {
+                if cursor < items.len() - 1 { cursor += 1; }
+            }
+            Key::Enter => {
+                return Some(cursor + 1); // 1-based episode index
+            }
+            Key::Esc => {
+                return None;
+            }
+            _ => {}
+        }
+        render_selection_list(&title, &items, cursor, false);
+    }
+}
 
 pub fn download_stream(
     m3u8_url: &str,
@@ -182,7 +492,7 @@ pub fn download_worker(worker_id: usize, manager_arc: Arc<Mutex<DownloadManager>
         if config.skip_existing && Path::new(&output_path).exists() {
             task.downloaded = true;
         } else {
-            match fetch_ani_api(&format!("/download/show/{}/{}/{}", task.imdb_id, task.season, task.episode), &config) {
+            match fetch_ani_api(&format!("/download/show/{}/{}/{}", task.imdb_id, task.stream_season, task.episode), &config) {
                 Ok(ep_res) => {
                     let m3u8 = ep_res.get("streamUrl").and_then(|v| v.as_str()).unwrap_or("").to_string();
                     let headers = ep_res.get("headers").cloned().unwrap_or(serde_json::json!({}));
@@ -333,6 +643,7 @@ pub fn handle_movie(imdb_id: &str, title: &str, config: &Config) {
     if config.use_ram_disk {
         let dummy_task = Task {
             season: "".to_string(),
+            stream_season: "".to_string(),
             episode: 0,
             base_dir: ".".to_string(),
             file_name_base: clean_title.clone(),
@@ -372,215 +683,135 @@ pub fn handle_movie(imdb_id: &str, title: &str, config: &Config) {
 
 pub fn handle_show(imdb_id: &str, title: &str, eps_data: &Value, config: Arc<Config>) {
     if eps_data.is_object() && !eps_data.as_object().unwrap().is_empty() {
-        println!("\nFound TV Show: {}", title);
-        println!("Available Seasons:");
-
         let eps_obj = eps_data.as_object().unwrap();
-        let mut seasons: Vec<String> = eps_obj.keys().cloned().collect();
+        let mut original_seasons: Vec<String> = eps_obj.keys().cloned().collect();
         // Sort seasons naturally if numeric
-        seasons.sort_by(|a, b| {
+        original_seasons.sort_by(|a, b| {
             let a_num = a.parse::<i32>().unwrap_or(0);
             let b_num = b.parse::<i32>().unwrap_or(0);
             a_num.cmp(&b_num)
         });
 
-        for (i, s) in seasons.iter().enumerate() {
+        let mut season_list: Vec<(String, String, usize, bool)> = Vec::new();
+        for s in &original_seasons {
             let val = &eps_obj[s];
             let count = if val.is_array() {
                 val.as_array().unwrap().len()
             } else {
                 val.as_i64().unwrap_or(0) as usize
             };
-            println!("  {}. Season {} ({} episodes)", i + 1, s, count);
+            season_list.push((s.clone(), s.clone(), count, true));
         }
 
-        println!("\nOptions:\n  1. Download one specific episode\n  2. Download one season\n  3. Download ALL episodes");
-        print!("Choose an option (1-3): ");
-        let _ = io::stdout().flush();
+        loop {
+            println!("\nFound TV Show: {}", title);
+            println!("Available Seasons:");
 
-        let mut input = String::new();
-        io::stdin().read_line(&mut input).unwrap();
-        let mode = input.trim().parse::<i32>().unwrap_or(0);
-        let clean_title = sanitize_filename(title);
-
-        if mode == 1 {
-            print!("Enter Season Number: ");
-            let _ = io::stdout().flush();
-            let mut s_in = String::new();
-            io::stdin().read_line(&mut s_in).unwrap();
-            let season_num = s_in.trim();
-
-            print!("Enter Episode Number: ");
-            let _ = io::stdout().flush();
-            let mut e_in = String::new();
-            io::stdin().read_line(&mut e_in).unwrap();
-            let ep_num = e_in.trim().parse::<usize>().unwrap_or(0);
-
-            let base = format!("./{}-S{}-E{}", clean_title, season_num, ep_num);
-            let output_path = format!("{}.mp4", base);
-
-            if config.skip_existing && Path::new(&output_path).exists() {
-                println!("File already exists at {}, skipping download.", output_path);
-                return;
-            }
-
-            match fetch_ani_api(&format!("/download/show/{}/{}/{}", imdb_id, season_num, ep_num), &config) {
-                Ok(ep_res) => {
-                    let stream_url = ep_res.get("streamUrl").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    let headers = ep_res.get("headers").cloned().unwrap_or(serde_json::json!({}));
-                    let sub_url = ep_res.get("sub").and_then(|v| v.as_str()).unwrap_or("").to_string();
-
-                    if !stream_url.is_empty() {
-                        if config.use_ram_disk {
-                            let dummy_task = Task {
-                                season: season_num.to_string(),
-                                episode: ep_num,
-                                base_dir: ".".to_string(),
-                                file_name_base: clean_title.clone(),
-                                imdb_id: imdb_id.to_string(),
-                                sub_url: sub_url.clone(),
-                                downloaded: false,
-                                failed: false,
-                                failure_printed: false,
-                                claimed_by: 0,
-                            };
-                            if let Err(e) = process_download_in_ram(&stream_url, &output_path, &headers, config.fragments, 0, &None, &config, &dummy_task) {
-                                eprintln!("Download failed: {}", e);
-                            } else {
-                                println!("\nDownload complete.");
-                            }
-                        } else if config.sub_only {
-                            if Path::new(&output_path).exists() {
-                                println!("[Subs] Found file, embedding subtitles for S{}E{}...", season_num, ep_num);
-                                handle_subtitles(imdb_id, season_num, ep_num, &output_path, 0, &None, &sub_url, &config);
-                            } else {
-                                eprintln!("Error: File is missing at {}", output_path);
-                            }
-                        } else {
-                            println!("\nDownloading S{}E{}...", season_num, ep_num);
-                            if let Err(e) = download_stream(&stream_url, &output_path, &headers, config.fragments, 0, &None, None) {
-                                eprintln!("Download failed: {}", e);
-                            } else {
-                                handle_subtitles(imdb_id, season_num, ep_num, &output_path, 0, &None, &sub_url, &config);
-                                println!("\nDownload complete.");
-                            }
-                        }
-                    } else {
-                        eprintln!("No stream found via primary source.");
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Primary source failed for that episode: {}", e);
-                }
-            }
-        } else if mode == 2 {
-            print!("Enter Season Number: ");
-            let _ = io::stdout().flush();
-            let mut s_in = String::new();
-            io::stdin().read_line(&mut s_in).unwrap();
-            let season_idx = s_in.trim().parse::<usize>().unwrap_or(0);
-
-            if season_idx == 0 || season_idx > seasons.len() {
-                eprintln!("Invalid season selection.");
-                return;
-            }
-            let chosen_season = &seasons[season_idx - 1];
-
-            let val = &eps_obj[chosen_season];
-            let ep_count = if val.is_array() {
-                val.as_array().unwrap().len()
-            } else {
-                val.as_i64().unwrap_or(0) as usize
-            };
-
-            let mut tasks = Vec::new();
-            for ep in 1..=ep_count {
-                tasks.push(Task {
-                    season: chosen_season.clone(),
-                    episode: ep,
-                    base_dir: format!("./{}/Season_{}", clean_title, chosen_season),
-                    file_name_base: format!("./{}/Season_{}/{}-S{}-E{}", clean_title, chosen_season, clean_title, chosen_season, ep),
-                    imdb_id: imdb_id.to_string(),
-                    sub_url: "".to_string(),
-                    downloaded: false,
-                    failed: false,
-                    failure_printed: false,
-                    claimed_by: usize::MAX,
-                });
-            }
-
-            let mut workers = Vec::new();
-            for i in 0..config.threads {
-                workers.push(WorkerStatus {
-                    id: i + 1,
-                    status: "Idle".to_string(),
-                    progress: 0.0,
-                    current_task: None,
-                    last_output: "".to_string(),
-                });
-            }
-
-            let manager = Arc::new(Mutex::new(DownloadManager {
-                tasks,
-                workers,
-                is_bulk: false,
-            }));
-
-            if config.sub_only {
-                println!("\nChecking and embedding subtitles for Season {} ({} episodes)...", chosen_season, ep_count);
-                manager.lock().unwrap().is_bulk = false;
-            } else {
-                println!("\nStarting bulk download of Season {} ({} episodes) with {} threads...", chosen_season, ep_count, config.threads);
-                manager.lock().unwrap().is_bulk = true;
-                for _ in 0..(config.threads * 2 + 2) {
-                    println!();
-                }
-                render(&manager);
-            }
-
-            let mut thread_handles = Vec::new();
-            for i in 0..config.threads {
-                let m_clone = manager.clone();
-                let c_clone = config.clone();
-                thread_handles.push(std::thread::spawn(move || {
-                    download_worker(i + 1, m_clone, c_clone);
-                }));
-            }
-
-            for handle in thread_handles {
-                let _ = handle.join();
-            }
-
-            let failed_count = manager.lock().unwrap().tasks.iter().filter(|t| t.failed).count();
-            if failed_count > 0 {
-                if config.sub_only {
-                    println!("\nSubtitles processing finished. {} episodes had errors or missing files.", failed_count);
+            for (i, (orig_s, new_s, count, enabled)) in season_list.iter().enumerate() {
+                let status_str = if *enabled { "[x]" } else { "[ ] [SKIPPED]" };
+                if orig_s == new_s {
+                    println!("  {}. {} Season {} ({} episodes)", i + 1, status_str, new_s, count);
                 } else {
-                    println!("\nNot all eps are downloaded and they need to run the command again");
-                }
-            } else {
-                if config.sub_only {
-                    println!("\nAll subtitles processed successfully.");
-                } else {
-                    println!("\nAll downloads completed.");
+                    println!("  {}. {} Season {} [mapped from original Season {}] ({} episodes)", i + 1, status_str, new_s, orig_s, count);
                 }
             }
-        } else if mode == 3 {
-            let mut tasks = Vec::new();
-            for s in &seasons {
-                let val = &eps_obj[s];
-                let ep_count = if val.is_array() {
-                    val.as_array().unwrap().len()
-                } else {
-                    val.as_i64().unwrap_or(0) as usize
+
+            println!("\nOptions:\n  1. Download one specific episode\n  2. Download one season\n  3. Download ALL episodes\n  4. Reorder/Rename seasons");
+            print!("Choose an option (1-4): ");
+            let _ = io::stdout().flush();
+
+            let mut input = String::new();
+            io::stdin().read_line(&mut input).unwrap();
+            let mode = input.trim().parse::<i32>().unwrap_or(0);
+            let clean_title = sanitize_filename(title);
+
+            if mode == 1 {
+                let season_idx = match interactive_select_season(&season_list) {
+                    Some(idx) => idx,
+                    None => continue,
+                };
+                let (orig_season, new_season, ep_count, _) = &season_list[season_idx];
+
+                let ep_num = match interactive_select_episode(new_season, *ep_count) {
+                    Some(ep) => ep,
+                    None => continue,
                 };
 
+                let base = format!("./{}-S{}-E{}", clean_title, new_season, ep_num);
+                let output_path = format!("{}.mp4", base);
+
+                if config.skip_existing && Path::new(&output_path).exists() {
+                    println!("File already exists at {}, skipping download.", output_path);
+                    return;
+                }
+
+                match fetch_ani_api(&format!("/download/show/{}/{}/{}", imdb_id, orig_season, ep_num), &config) {
+                    Ok(ep_res) => {
+                        let stream_url = ep_res.get("streamUrl").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let headers = ep_res.get("headers").cloned().unwrap_or(serde_json::json!({}));
+                        let sub_url = ep_res.get("sub").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+                        if !stream_url.is_empty() {
+                            if config.use_ram_disk {
+                                let dummy_task = Task {
+                                    season: new_season.clone(),
+                                    stream_season: orig_season.clone(),
+                                    episode: ep_num,
+                                    base_dir: ".".to_string(),
+                                    file_name_base: clean_title.clone(),
+                                    imdb_id: imdb_id.to_string(),
+                                    sub_url: sub_url.clone(),
+                                    downloaded: false,
+                                    failed: false,
+                                    failure_printed: false,
+                                    claimed_by: 0,
+                                };
+                                if let Err(e) = process_download_in_ram(&stream_url, &output_path, &headers, config.fragments, 0, &None, &config, &dummy_task) {
+                                    eprintln!("Download failed: {}", e);
+                                } else {
+                                    println!("\nDownload complete.");
+                                }
+                            } else if config.sub_only {
+                                if Path::new(&output_path).exists() {
+                                    println!("[Subs] Found file, embedding subtitles for S{}E{}...", new_season, ep_num);
+                                    handle_subtitles(imdb_id, new_season, ep_num, &output_path, 0, &None, &sub_url, &config);
+                                } else {
+                                    eprintln!("Error: File is missing at {}", output_path);
+                                }
+                            } else {
+                                println!("\nDownloading S{}E{}...", new_season, ep_num);
+                                if let Err(e) = download_stream(&stream_url, &output_path, &headers, config.fragments, 0, &None, None) {
+                                    eprintln!("Download failed: {}", e);
+                                } else {
+                                    handle_subtitles(imdb_id, new_season, ep_num, &output_path, 0, &None, &sub_url, &config);
+                                    println!("\nDownload complete.");
+                                }
+                            }
+                        } else {
+                            eprintln!("No stream found via primary source.");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Primary source failed for that episode: {}", e);
+                    }
+                }
+                break;
+            } else if mode == 2 {
+                let season_idx = match interactive_select_season(&season_list) {
+                    Some(idx) => idx,
+                    None => continue,
+                };
+                let (orig_season, new_season, ep_count, _) = &season_list[season_idx];
+                let ep_count = *ep_count;
+
+                let mut tasks = Vec::new();
                 for ep in 1..=ep_count {
                     tasks.push(Task {
-                        season: s.clone(),
+                        season: new_season.clone(),
+                        stream_season: orig_season.clone(),
                         episode: ep,
-                        base_dir: format!("./{}/Season_{}", clean_title, s),
-                        file_name_base: format!("./{}/Season_{}/{}-S{}-E{}", clean_title, s, clean_title, s, ep),
+                        base_dir: format!("./{}/Season_{}", clean_title, new_season),
+                        file_name_base: format!("./{}/Season_{}/{}-S{}-E{}", clean_title, new_season, clean_title, new_season, ep),
                         imdb_id: imdb_id.to_string(),
                         sub_url: "".to_string(),
                         downloaded: false,
@@ -589,66 +820,156 @@ pub fn handle_show(imdb_id: &str, title: &str, eps_data: &Value, config: Arc<Con
                         claimed_by: usize::MAX,
                     });
                 }
-            }
 
-            let mut workers = Vec::new();
-            for i in 0..config.threads {
-                workers.push(WorkerStatus {
-                    id: i + 1,
-                    status: "Idle".to_string(),
-                    progress: 0.0,
-                    current_task: None,
-                    last_output: "".to_string(),
-                });
-            }
-
-            let manager = Arc::new(Mutex::new(DownloadManager {
-                tasks,
-                workers,
-                is_bulk: false,
-            }));
-
-            if config.sub_only {
-                println!("\nChecking and embedding subtitles for all episodes ({} episodes)...", manager.lock().unwrap().tasks.len());
-                manager.lock().unwrap().is_bulk = false;
-            } else {
-                println!("\nStarting bulk download ({} episodes) with {} threads...", manager.lock().unwrap().tasks.len(), config.threads);
-                manager.lock().unwrap().is_bulk = true;
-                for _ in 0..(config.threads * 2 + 2) {
-                    println!();
+                let mut workers = Vec::new();
+                for i in 0..config.threads {
+                    workers.push(WorkerStatus {
+                        id: i + 1,
+                        status: "Idle".to_string(),
+                        progress: 0.0,
+                        current_task: None,
+                        last_output: "".to_string(),
+                    });
                 }
-                render(&manager);
-            }
 
-            let mut thread_handles = Vec::new();
-            for i in 0..config.threads {
-                let m_clone = manager.clone();
-                let c_clone = config.clone();
-                thread_handles.push(std::thread::spawn(move || {
-                    download_worker(i + 1, m_clone, c_clone);
+                let manager = Arc::new(Mutex::new(DownloadManager {
+                    tasks,
+                    workers,
+                    is_bulk: false,
                 }));
-            }
 
-            for handle in thread_handles {
-                let _ = handle.join();
-            }
-
-            let failed_count = manager.lock().unwrap().tasks.iter().filter(|t| t.failed).count();
-            if failed_count > 0 {
                 if config.sub_only {
-                    println!("\nSubtitles processing finished. {} episodes had errors or missing files.", failed_count);
+                    println!("\nChecking and embedding subtitles for Season {} ({} episodes)...", new_season, ep_count);
+                    manager.lock().unwrap().is_bulk = false;
                 } else {
-                    println!("\nNot all eps are downloaded and they need to run the command again");
+                    println!("\nStarting bulk download of Season {} ({} episodes) with {} threads...", new_season, ep_count, config.threads);
+                    manager.lock().unwrap().is_bulk = true;
+                    for _ in 0..(config.threads * 2 + 2) {
+                        println!();
+                    }
+                    render(&manager);
                 }
+
+                let mut thread_handles = Vec::new();
+                for i in 0..config.threads {
+                    let m_clone = manager.clone();
+                    let c_clone = config.clone();
+                    thread_handles.push(std::thread::spawn(move || {
+                        download_worker(i + 1, m_clone, c_clone);
+                    }));
+                }
+
+                for handle in thread_handles {
+                    let _ = handle.join();
+                }
+
+                let failed_count = manager.lock().unwrap().tasks.iter().filter(|t| t.failed).count();
+                if failed_count > 0 {
+                    if config.sub_only {
+                        println!("\nSubtitles processing finished. {} episodes had errors or missing files.", failed_count);
+                    } else {
+                        println!("\nNot all eps are downloaded and they need to run the command again");
+                    }
+                } else {
+                    if config.sub_only {
+                        println!("\nAll subtitles processed successfully.");
+                    } else {
+                        println!("\nAll downloads completed.");
+                    }
+                }
+                break;
+            } else if mode == 3 {
+                let mut tasks = Vec::new();
+                for (orig_season, new_season, ep_count, enabled) in &season_list {
+                    if !*enabled {
+                        continue;
+                    }
+                    let ep_count = *ep_count;
+
+                    for ep in 1..=ep_count {
+                        tasks.push(Task {
+                            season: new_season.clone(),
+                            stream_season: orig_season.clone(),
+                            episode: ep,
+                            base_dir: format!("./{}/Season_{}", clean_title, new_season),
+                            file_name_base: format!("./{}/Season_{}/{}-S{}-E{}", clean_title, new_season, clean_title, new_season, ep),
+                            imdb_id: imdb_id.to_string(),
+                            sub_url: "".to_string(),
+                            downloaded: false,
+                            failed: false,
+                            failure_printed: false,
+                            claimed_by: usize::MAX,
+                        });
+                    }
+                }
+
+                if tasks.is_empty() {
+                    println!("\nNo seasons selected for download (all are skipped).");
+                    break;
+                }
+
+                let mut workers = Vec::new();
+                for i in 0..config.threads {
+                    workers.push(WorkerStatus {
+                        id: i + 1,
+                        status: "Idle".to_string(),
+                        progress: 0.0,
+                        current_task: None,
+                        last_output: "".to_string(),
+                    });
+                }
+
+                let manager = Arc::new(Mutex::new(DownloadManager {
+                    tasks,
+                    workers,
+                    is_bulk: false,
+                }));
+
+                if config.sub_only {
+                    println!("\nChecking and embedding subtitles for all episodes ({} episodes)...", manager.lock().unwrap().tasks.len());
+                    manager.lock().unwrap().is_bulk = false;
+                } else {
+                    println!("\nStarting bulk download ({} episodes) with {} threads...", manager.lock().unwrap().tasks.len(), config.threads);
+                    manager.lock().unwrap().is_bulk = true;
+                    for _ in 0..(config.threads * 2 + 2) {
+                        println!();
+                    }
+                    render(&manager);
+                }
+
+                let mut thread_handles = Vec::new();
+                for i in 0..config.threads {
+                    let m_clone = manager.clone();
+                    let c_clone = config.clone();
+                    thread_handles.push(std::thread::spawn(move || {
+                        download_worker(i + 1, m_clone, c_clone);
+                    }));
+                }
+
+                for handle in thread_handles {
+                    let _ = handle.join();
+                }
+
+                let failed_count = manager.lock().unwrap().tasks.iter().filter(|t| t.failed).count();
+                if failed_count > 0 {
+                    if config.sub_only {
+                        println!("\nSubtitles processing finished. {} episodes had errors or missing files.", failed_count);
+                    } else {
+                        println!("\nNot all eps are downloaded and they need to run the command again");
+                    }
+                } else {
+                    if config.sub_only {
+                        println!("\nAll subtitles processed successfully.");
+                    } else {
+                        println!("\nAll downloads completed.");
+                    }
+                }
+                break;
+            } else if mode == 4 {
+                interactive_reorder_loop(&mut season_list);
             } else {
-                if config.sub_only {
-                    println!("\nAll subtitles processed successfully.");
-                } else {
-                    println!("\nAll downloads completed.");
-                }
+                eprintln!("Invalid option.");
             }
-        } else {
-            eprintln!("Invalid option.");
         }
         return;
     }
@@ -692,6 +1013,7 @@ pub fn handle_show(imdb_id: &str, title: &str, eps_data: &Value, config: Arc<Con
             if config.use_ram_disk {
                 let dummy_task = Task {
                     season: season_idx.to_string(),
+                    stream_season: season_idx.to_string(),
                     episode: chosen_ep,
                     base_dir: ".".to_string(),
                     file_name_base: clean_title.clone(),
