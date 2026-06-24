@@ -11,6 +11,26 @@ mod subtitles;
 mod ram;
 mod downloader;
 
+fn reconstruct_args_for_sudo_suggestion() -> String {
+    let mut args = Vec::new();
+    let mut iter = std::env::args().skip(1);
+    while let Some(arg) = iter.next() {
+        if arg == "--key" {
+            let _ = iter.next();
+            continue;
+        }
+        if arg.starts_with("--key=") {
+            continue;
+        }
+        if arg.contains(' ') {
+            args.push(format!("\"{}\"", arg));
+        } else {
+            args.push(arg);
+        }
+    }
+    args.join(" ")
+}
+
 fn main() {
     let args = config::Args::parse();
 
@@ -24,10 +44,28 @@ fn main() {
 
     if api_key.is_empty() {
         eprintln!("Error: API key required. Contact @kobosh_com on telegram/@kobosh.com on discord for an API key");
+        #[cfg(unix)]
+        {
+            if unsafe { libc::getuid() } == 0 {
+                let reconstructed = reconstruct_args_for_sudo_suggestion();
+                eprintln!("\nTip: Since you are running with sudo, your user environment variables and PATH are not preserved by default.");
+                eprintln!("Try running the command like this:\n");
+                eprintln!("sudo -E env PATH=\"$PATH\" $(which imdbdownloader) --key $ANIAPI_TOKEN {}\n", reconstructed);
+            }
+        }
         std::process::exit(1);
     }
 
     if !config::check_dependencies(args.sub_only) {
+        #[cfg(unix)]
+        {
+            if unsafe { libc::getuid() } == 0 {
+                let reconstructed = reconstruct_args_for_sudo_suggestion();
+                eprintln!("\nTip: Since you are running with sudo, your user environment variables and PATH are not preserved by default.");
+                eprintln!("Try running the command like this:\n");
+                eprintln!("sudo -E env PATH=\"$PATH\" $(which imdbdownloader) --key $ANIAPI_TOKEN {}\n", reconstructed);
+            }
+        }
         std::process::exit(1);
     }
 
