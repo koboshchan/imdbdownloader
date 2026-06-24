@@ -62,6 +62,11 @@ fn main() {
                 Ok(guard) => {
                     ram_disk_path = Some(guard.mount_path.clone());
                     _ram_disk_guard = Some(guard);
+
+                    ctrlc::set_handler(move || {
+                        ram::cleanup_ram_disk_global();
+                        std::process::exit(130);
+                    }).expect("Error setting Ctrl-C handler");
                 }
                 Err(e) => {
                     eprintln!("Error mounting RAM disk: {}", e);

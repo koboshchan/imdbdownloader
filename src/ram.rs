@@ -1,7 +1,33 @@
 use std::fs;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::process::Command;
+
+static MOUNTED_RAM_DISK: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+pub fn cleanup_ram_disk_global() {
+    if let Some(cell) = MOUNTED_RAM_DISK.get() {
+        if let Ok(mut opt) = cell.lock() {
+            if let Some(mount_path) = opt.take() {
+                println!("\nCleaning up RAM disk at {}...", mount_path);
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = Command::new("diskutil")
+                        .arg("eject")
+                        .arg(&mount_path)
+                        .status();
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    let _ = Command::new("umount")
+                        .arg(&mount_path)
+                        .status();
+                    let _ = std::fs::remove_dir(&mount_path);
+                }
+            }
+        }
+    }
+}
 
 pub struct RamDiskGuard {
     pub mount_path: String,
@@ -9,22 +35,10 @@ pub struct RamDiskGuard {
 
 impl Drop for RamDiskGuard {
     fn drop(&mut self) {
-        #[cfg(target_os = "macos")]
-        {
-            let _ = Command::new("diskutil")
-                .arg("eject")
-                .arg(&self.mount_path)
-                .status();
-        }
-        #[cfg(target_os = "linux")]
-        {
-            let _ = Command::new("umount")
-                .arg(&self.mount_path)
-                .status();
-            let _ = std::fs::remove_dir(&self.mount_path);
-        }
+        cleanup_ram_disk_global();
     }
 }
+
 
 #[cfg(target_os = "macos")]
 fn setup_macos_ram_disk(hash: &str) -> Result<String, String> {
@@ -98,20 +112,26 @@ pub fn setup_ram_disk(id: &str) -> Result<RamDiskGuard, String> {
     hasher.update(id.as_bytes());
     let hash = format!("{:x}", hasher.finalize());
     
-    #[cfg(target_os = "macos")]
-    {
-        let mount_path = setup_macos_ram_disk(&hash)?;
-        Ok(RamDiskGuard { mount_path })
+    let mount_path = {
+        #[cfg(target_os = "macos")]
+        {
+            setup_macos_ram_disk(&hash)?
+        }
+        #[cfg(target_os = "linux")]
+        {
+            setup_linux_ram_disk(&hash)?
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            return Err("Unsupported operating system for RAM disk.".to_string());
+        }
+    };
+
+    if let Some(mut cell) = MOUNTED_RAM_DISK.get_or_init(|| Mutex::new(None)).lock().ok() {
+        *cell = Some(mount_path.clone());
     }
-    #[cfg(target_os = "linux")]
-    {
-        let mount_path = setup_linux_ram_disk(&hash)?;
-        Ok(RamDiskGuard { mount_path })
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        Err("Unsupported operating system for RAM disk.".to_string())
-    }
+
+    Ok(RamDiskGuard { mount_path })
 }
 
 pub fn process_download_in_ram(
