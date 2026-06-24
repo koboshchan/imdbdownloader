@@ -5,7 +5,7 @@ use std::process::Command;
 #[command(name = "imdbdownloader", about = "Downloads movies and TV shows by IMDb ID, Animetsu ID, Anikoto ID, or Miruro ID using yt-dlp and ffmpeg")]
 pub struct Args {
     #[arg(help = "IMDb ID, Animetsu ID, Anikoto ID, or Miruro ID")]
-    pub imdb_id: String,
+    pub imdb_id: Option<String>,
 
     #[arg(long, help = "AniAPI key (falls back to ANIAPI_TOKEN env var)")]
     pub key: Option<String>,
@@ -50,6 +50,10 @@ pub struct Config {
     pub skip_existing: bool,
     pub use_ram_disk: bool,
     pub ram_disk_path: Option<String>,
+    pub provider: String,
+    pub id: String,
+    pub args: Vec<String>,
+    pub imdb_id: String,
 }
 
 

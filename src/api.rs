@@ -46,15 +46,20 @@ pub fn fetch_ani_api(pathname: &str, config: &Config) -> Result<Value, String> {
     serde_json::from_str(cleaned).map_err(|e| format!("JSON Parse failed: {} | Resp: {}", e, resp))
 }
 
-pub fn fetch_imdb_metadata(imdb_id: &str, config: &Config) -> Metadata {
-    match fetch_ani_api(&format!("/info/{}", imdb_id), config) {
+pub fn fetch_imdb_metadata(config: &Config) -> Metadata {
+    let mut path = format!("/info?provider={}&id={}", config.provider, config.id);
+    for arg in &config.args {
+        path.push_str(&format!("&args={}", arg));
+    }
+    let default_title = format!("{}:{}", config.provider, config.id);
+    match fetch_ani_api(&path, config) {
         Ok(d) => {
             if d.get("error").is_some() && !d["error"].is_null() {
                 println!("[Meta] AniAPI error: {}", d["error"].as_str().unwrap_or("Unknown"));
             }
             serde_json::from_value(d).unwrap_or_else(|_| {
                 Metadata {
-                    title: imdb_id.to_string(),
+                    title: default_title.clone(),
                     original_title: None,
                     media_type: Some("movie".to_string()),
                     type_field: None,
@@ -67,7 +72,7 @@ pub fn fetch_imdb_metadata(imdb_id: &str, config: &Config) -> Metadata {
         Err(e) => {
             eprintln!("[Meta] AniAPI lookup failed: {}", e);
             Metadata {
-                title: imdb_id.to_string(),
+                title: default_title,
                 original_title: None,
                 media_type: Some("movie".to_string()),
                 type_field: None,

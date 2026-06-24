@@ -247,6 +247,39 @@ fn render_selection_list(title: &str, items: &[String], cursor: usize, initial: 
     let _ = io::stdout().flush();
 }
 
+pub fn interactive_choose(title: &str, choices: &[String]) -> Option<usize> {
+    if choices.is_empty() {
+        return None;
+    }
+
+    for _ in 0..(choices.len() + 2) {
+        println!();
+    }
+
+    let mut cursor = 0;
+    render_selection_list(title, choices, cursor, true);
+
+    let _raw_guard = RawMode::enable().ok();
+    loop {
+        match read_key() {
+            Key::Up => {
+                if cursor > 0 { cursor -= 1; }
+            }
+            Key::Down => {
+                if cursor < choices.len() - 1 { cursor += 1; }
+            }
+            Key::Enter => {
+                return Some(cursor);
+            }
+            Key::Esc => {
+                return None;
+            }
+            _ => {}
+        }
+        render_selection_list(title, choices, cursor, false);
+    }
+}
+
 fn interactive_select_season(seasons: &[(String, String, usize, bool)]) -> Option<usize> {
     if seasons.is_empty() {
         return None;
@@ -487,7 +520,14 @@ pub fn download_worker(worker_id: usize, manager_arc: Arc<Mutex<DownloadManager>
         if config.skip_existing && Path::new(&output_path).exists() {
             task.downloaded = true;
         } else {
-            match fetch_ani_api(&format!("/download/show/{}/{}/{}", task.imdb_id, task.stream_season, task.episode), &config) {
+            let mut download_path = format!(
+                "/download/show?provider={}&id={}&season={}&episode={}",
+                config.provider, config.id, task.stream_season, task.episode
+            );
+            for arg in &config.args {
+                download_path.push_str(&format!("&args={}", arg));
+            }
+            match fetch_ani_api(&download_path, &config) {
                 Ok(ep_res) => {
                     let m3u8 = ep_res.get("streamUrl").and_then(|v| v.as_str()).unwrap_or("").to_string();
                     let headers = ep_res.get("headers").cloned().unwrap_or(serde_json::json!({}));
@@ -616,7 +656,14 @@ pub fn handle_movie(imdb_id: &str, title: &str, config: &Config) {
         return;
     }
 
-    let movie_data = match fetch_ani_api(&format!("/download/movie/{}", imdb_id), config) {
+    let mut download_path = format!(
+        "/download/movie?provider={}&id={}",
+        config.provider, config.id
+    );
+    for arg in &config.args {
+        download_path.push_str(&format!("&args={}", arg));
+    }
+    let movie_data = match fetch_ani_api(&download_path, config) {
         Ok(d) => d,
         Err(_) => {
             eprintln!("No streams found for this movie.");
@@ -740,7 +787,14 @@ pub fn handle_show(imdb_id: &str, title: &str, eps_data: &Value, config: Arc<Con
                     return;
                 }
 
-                match fetch_ani_api(&format!("/download/show/{}/{}/{}", imdb_id, orig_season, ep_num), &config) {
+                let mut download_path = format!(
+                    "/download/show?provider={}&id={}&season={}&episode={}",
+                    config.provider, config.id, orig_season, ep_num
+                );
+                for arg in &config.args {
+                    download_path.push_str(&format!("&args={}", arg));
+                }
+                match fetch_ani_api(&download_path, &config) {
                     Ok(ep_res) => {
                         let stream_url = ep_res.get("streamUrl").and_then(|v| v.as_str()).unwrap_or("").to_string();
                         let headers = ep_res.get("headers").cloned().unwrap_or(serde_json::json!({}));
@@ -994,7 +1048,14 @@ pub fn handle_show(imdb_id: &str, title: &str, eps_data: &Value, config: Arc<Con
         return;
     }
 
-    match fetch_ani_api(&format!("/download/show/{}/{}/{}", imdb_id, season_idx, chosen_ep), &config) {
+    let mut download_path = format!(
+        "/download/show?provider={}&id={}&season={}&episode={}",
+        config.provider, config.id, season_idx, chosen_ep
+    );
+    for arg in &config.args {
+        download_path.push_str(&format!("&args={}", arg));
+    }
+    match fetch_ani_api(&download_path, &config) {
         Ok(ep_res) => {
             let stream_url = ep_res.get("streamUrl").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let headers = ep_res.get("headers").cloned().unwrap_or(serde_json::json!({}));
