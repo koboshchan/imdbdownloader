@@ -38,6 +38,39 @@ fn main() {
         sub_imdb_id = args.imdb_id.clone();
     }
 
+    let mut _ram_disk_guard = None;
+    let mut ram_disk_path = None;
+
+    if args.use_ram_disk {
+        #[cfg(target_os = "windows")]
+        {
+            eprintln!("Error: RAM disk feature (-r) is not supported on Windows.");
+            std::process::exit(1);
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            eprintln!("Error: RAM disk feature (-r) is only supported on macOS and Linux.");
+            std::process::exit(1);
+        }
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            if unsafe { libc::getuid() } != 0 {
+                eprintln!("Error: RAM disk feature (-r) requires sudo/root privileges. Please run with sudo.");
+                std::process::exit(1);
+            }
+            match ram::setup_ram_disk(&args.imdb_id) {
+                Ok(guard) => {
+                    ram_disk_path = Some(guard.mount_path.clone());
+                    _ram_disk_guard = Some(guard);
+                }
+                Err(e) => {
+                    eprintln!("Error mounting RAM disk: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
     let config = Arc::new(config::Config {
         threads: args.threads,
         fragments: args.concurrent_fragments,
@@ -49,6 +82,7 @@ fn main() {
         sub_only: args.sub_only,
         skip_existing: args.skip_existing,
         use_ram_disk: args.use_ram_disk,
+        ram_disk_path,
     });
 
     println!("Analyzing IMDB Media Signature...");

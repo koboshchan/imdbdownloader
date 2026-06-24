@@ -49,7 +49,9 @@ pub struct Config {
     pub sub_only: bool,
     pub skip_existing: bool,
     pub use_ram_disk: bool,
+    pub ram_disk_path: Option<String>,
 }
+
 
 pub fn check_dependencies(sub_only: bool) -> bool {
     let check_cmd = |cmd: &str| -> bool {

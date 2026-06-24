@@ -14,7 +14,7 @@ use crate::progress::render;
 use crate::api::{fetch_ani_api, sanitize_filename};
 use crate::unmask::{is_masked_file, unmask_file};
 use crate::subtitles::handle_subtitles;
-use crate::ram::{spawn_command_with_inherited_fds, process_download_in_ram};
+use crate::ram::process_download_in_ram;
 
 struct RawMode {
     orig: termios,
@@ -332,7 +332,6 @@ pub fn download_stream(
     fragments: usize,
     worker_id: usize,
     manager_option: &Option<Arc<Mutex<DownloadManager>>>,
-    shm_fd: Option<i32>,
 ) -> Result<(), String> {
     let mut user_agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:152.0) Gecko/20100101 Firefox/152.0".to_string();
     if let Some(ua) = extra_headers.get("User-Agent").and_then(|v| v.as_str()) {
@@ -384,18 +383,14 @@ pub fn download_stream(
     };
 
     while retries <= max_retries {
-        let mut child = if let Some(fd) = shm_fd {
-            spawn_command_with_inherited_fds(&cmd_args, &[fd], true)
-                .map_err(|e| format!("Failed to spawn yt-dlp: {}", e))?
-        } else {
-            Command::new("sh")
-                .arg("-c")
-                .arg(&cmd_args)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .map_err(|e| format!("Failed to spawn yt-dlp: {}", e))?
-        };
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(&cmd_args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("Failed to spawn yt-dlp: {}", e))?;
+
 
         let stdout = child.stdout.take().ok_or("Failed to capture yt-dlp stdout")?;
         let reader = BufReader::new(stdout);
@@ -541,7 +536,7 @@ pub fn download_worker(worker_id: usize, manager_arc: Arc<Mutex<DownloadManager>
                     } else {
                         let _ = fs::create_dir_all(&task.base_dir);
 
-                        match download_stream(&m3u8, &output_path, &headers, config.fragments, worker_id, &Some(manager_arc.clone()), None) {
+                        match download_stream(&m3u8, &output_path, &headers, config.fragments, worker_id, &Some(manager_arc.clone())) {
                             Ok(_) => {
                                 handle_subtitles(
                                     &task.imdb_id,
@@ -672,7 +667,7 @@ pub fn handle_movie(imdb_id: &str, title: &str, config: &Config) {
 
         println!("Downloading to {}...", output_path);
 
-        if let Err(e) = download_stream(&stream_url, &output_path, &headers, config.fragments, 0, &None, None) {
+        if let Err(e) = download_stream(&stream_url, &output_path, &headers, config.fragments, 0, &None) {
             eprintln!("\nDownload failed: {}", e);
         } else {
             handle_subtitles(imdb_id, "", 0, &output_path, 0, &None, &sub_url, config);
@@ -780,7 +775,7 @@ pub fn handle_show(imdb_id: &str, title: &str, eps_data: &Value, config: Arc<Con
                                 }
                             } else {
                                 println!("\nDownloading S{}E{}...", new_season, ep_num);
-                                if let Err(e) = download_stream(&stream_url, &output_path, &headers, config.fragments, 0, &None, None) {
+                                if let Err(e) = download_stream(&stream_url, &output_path, &headers, config.fragments, 0, &None) {
                                     eprintln!("Download failed: {}", e);
                                 } else {
                                     handle_subtitles(imdb_id, new_season, ep_num, &output_path, 0, &None, &sub_url, &config);
@@ -1042,7 +1037,7 @@ pub fn handle_show(imdb_id: &str, title: &str, eps_data: &Value, config: Arc<Con
 
                 println!("\nDownloading S{}E{}...", season_idx, chosen_ep);
 
-                if let Err(e) = download_stream(&stream_url, &output_path, &headers, config.fragments, 0, &None, None) {
+                if let Err(e) = download_stream(&stream_url, &output_path, &headers, config.fragments, 0, &None) {
                     eprintln!("Download failed: {}", e);
                 } else {
                     handle_subtitles(imdb_id, season_idx, chosen_ep, &output_path, 0, &None, &sub_url, &config);

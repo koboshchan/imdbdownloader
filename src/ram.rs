@@ -1,88 +1,117 @@
-use std::ffi::CString;
-use std::os::unix::io::FromRawFd;
-use std::fs::{self, File};
+use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::process::{Command, Stdio};
+use std::process::Command;
 
-pub struct SharedMemory {
-    pub name: String,
-    pub fd: i32,
+pub struct RamDiskGuard {
+    pub mount_path: String,
 }
 
-impl SharedMemory {
-    pub fn new(suffix: &str) -> Result<Self, String> {
-        let name = format!("/imdb_shm_{}_{}", std::process::id(), suffix);
-        let c_name = CString::new(name.clone()).map_err(|e| e.to_string())?;
-        
-        let fd = unsafe {
-            libc::shm_open(
-                c_name.as_ptr(),
-                libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
-                0o600,
-            )
-        };
-        if fd < 0 {
-            return Err(format!("shm_open failed: {}", std::io::Error::last_os_error()));
-        }
-        Ok(Self { name, fd })
-    }
-
-    pub fn path(&self) -> String {
-        format!("/dev/fd/{}", self.fd)
-    }
-
-    pub fn rewind(&self) -> Result<(), String> {
-        let res = unsafe { libc::lseek(self.fd, 0, libc::SEEK_SET) };
-        if res < 0 {
-            return Err(format!("lseek failed: {}", std::io::Error::last_os_error()));
-        }
-        Ok(())
-    }
-}
-
-impl Drop for SharedMemory {
+impl Drop for RamDiskGuard {
     fn drop(&mut self) {
-        unsafe {
-            libc::close(self.fd);
-            if let Ok(c_name) = CString::new(self.name.clone()) {
-                libc::shm_unlink(c_name.as_ptr());
-            }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = Command::new("diskutil")
+                .arg("eject")
+                .arg(&self.mount_path)
+                .status();
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let _ = Command::new("umount")
+                .arg(&self.mount_path)
+                .status();
+            let _ = std::fs::remove_dir(&self.mount_path);
         }
     }
 }
 
-pub fn spawn_command_with_inherited_fds(
-    cmd_args: &str,
-    fds: &[i32],
-    piped_output: bool,
-) -> Result<std::process::Child, String> {
-    use std::os::unix::process::CommandExt;
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c").arg(cmd_args);
+#[cfg(target_os = "macos")]
+fn setup_macos_ram_disk(hash: &str) -> Result<String, String> {
+    let vol_name = format!("tmp_{}", hash);
+    let output = Command::new("hdid")
+        .arg("-nomount")
+        .arg("ram://67108864")
+        .output()
+        .map_err(|e| format!("Failed to run hdid: {}", e))?;
     
-    if piped_output {
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-    } else {
-        cmd.stdout(Stdio::null());
-        cmd.stderr(Stdio::null());
+    if !output.status.success() {
+        return Err(format!("hdid command failed: {}", String::from_utf8_lossy(&output.stderr)));
     }
-
-    let fds_vec = fds.to_vec();
-    unsafe {
-        cmd.pre_exec(move || {
-            for &fd in &fds_vec {
-                let flags = libc::fcntl(fd, libc::F_GETFD);
-                if flags != -1 {
-                    libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
-                }
-            }
-            Ok(())
-        });
+    
+    let dev_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if dev_path.is_empty() {
+        return Err("hdid returned empty device path".to_string());
     }
+    
+    let erase_status = Command::new("diskutil")
+        .arg("erasevolume")
+        .arg("HFS+")
+        .arg(&vol_name)
+        .arg(&dev_path)
+        .status()
+        .map_err(|e| format!("Failed to run diskutil erasevolume: {}", e))?;
+        
+    if !erase_status.success() {
+        return Err(format!("diskutil erasevolume failed for device {}", dev_path));
+    }
+    
+    Ok(format!("/Volumes/{}", vol_name))
+}
 
-    cmd.spawn().map_err(|e| e.to_string())
+#[cfg(target_os = "linux")]
+fn setup_linux_ram_disk(hash: &str) -> Result<String, String> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let mount_path = std::path::Path::new(&home).join(format!("tmp_{}", hash));
+    let mount_path_str = mount_path.to_string_lossy().to_string();
+    
+    let mkdir_status = Command::new("mkdir")
+        .arg("-p")
+        .arg(&mount_path_str)
+        .status()
+        .map_err(|e| format!("Failed to run mkdir: {}", e))?;
+        
+    if !mkdir_status.success() {
+        return Err(format!("mkdir -p {} failed", mount_path_str));
+    }
+    
+    let mount_status = Command::new("mount")
+        .arg("-t")
+        .arg("tmpfs")
+        .arg("-o")
+        .arg("size=8G")
+        .arg("tmpfs")
+        .arg(&mount_path_str)
+        .status()
+        .map_err(|e| format!("Failed to run mount: {}", e))?;
+        
+    if !mount_status.success() {
+        return Err(format!("mount -t tmpfs failed for {}", mount_path_str));
+    }
+    
+    Ok(mount_path_str)
+}
+
+pub fn setup_ram_disk(id: &str) -> Result<RamDiskGuard, String> {
+    use sha2::{Sha256, Digest};
+    let mut hasher = Sha256::new();
+    hasher.update(id.as_bytes());
+    let hash = format!("{:x}", hasher.finalize());
+    
+    #[cfg(target_os = "macos")]
+    {
+        let mount_path = setup_macos_ram_disk(&hash)?;
+        Ok(RamDiskGuard { mount_path })
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mount_path = setup_linux_ram_disk(&hash)?;
+        Ok(RamDiskGuard { mount_path })
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        Err("Unsupported operating system for RAM disk.".to_string())
+    }
 }
 
 pub fn process_download_in_ram(
@@ -112,60 +141,62 @@ pub fn process_download_in_ram(
         }
     };
 
-    let shm_download = SharedMemory::new("download")?;
+    let ram_disk_dir = config.ram_disk_path.as_ref().ok_or("RAM disk path is not configured")?;
+    let filename = Path::new(output_path)
+        .file_name()
+        .ok_or_else(|| "Invalid output path".to_string())?
+        .to_str()
+        .ok_or_else(|| "Invalid unicode in output path".to_string())?;
+    
+    let ram_output_path = Path::new(ram_disk_dir).join(filename);
+    let ram_output_path_str = ram_output_path.to_string_lossy().to_string();
+
     log_progress("Downloading", "Starting download to RAM...");
 
     crate::downloader::download_stream(
         m3u8_url,
-        &shm_download.path(),
+        &ram_output_path_str,
         extra_headers,
         fragments,
         worker_id,
         manager_arc,
-        Some(shm_download.fd),
     )?;
 
-    let mut shm_current = shm_download;
-    shm_current.rewind()?;
+    let mut current_ram_path = ram_output_path_str;
 
-    if crate::unmask::is_masked_file(&shm_current.path()) {
+    if crate::unmask::is_masked_file(&current_ram_path) {
         log_progress("Unmasking", "Removing image wrapper in RAM...");
-        let shm_unmask = SharedMemory::new("unmasked")?;
-        crate::unmask::unmask_file_ram(&shm_current, &shm_unmask)?;
-        shm_current = shm_unmask;
+        let unmasked_ram_path = format!("{}.unmasked.mp4", current_ram_path);
+        if crate::unmask::unmask_file(&current_ram_path, &unmasked_ram_path) {
+            let _ = fs::remove_file(&current_ram_path);
+            current_ram_path = unmasked_ram_path;
+        } else {
+            return Err("Failed to unmask file".to_string());
+        }
     }
 
-    shm_current.rewind()?;
-    let mut active_shm = shm_current;
-
     if config.embed_subs || config.sub_only {
-        let shm_sub = SharedMemory::new("subbed")?;
-        if crate::subtitles::handle_subtitles_ram(
+        crate::subtitles::handle_subtitles(
             &task.imdb_id,
             &task.season,
             task.episode,
-            &active_shm,
-            &shm_sub,
+            &current_ram_path,
             worker_id,
             manager_arc,
             &task.sub_url,
             config,
-        ).is_ok() {
-            active_shm = shm_sub;
-        }
+        );
     }
 
     log_progress("Saving", "Writing final file to disk...");
-    active_shm.rewind()?;
-
-    let mut shm_file = unsafe { File::from_raw_fd(libc::dup(active_shm.fd)) };
-    
     if let Some(parent) = Path::new(output_path).parent() {
         let _ = fs::create_dir_all(parent);
     }
     
-    let mut disk_file = File::create(output_path).map_err(|e| format!("Failed to create output file: {}", e))?;
-    std::io::copy(&mut shm_file, &mut disk_file).map_err(|e| format!("Failed to copy file to disk: {}", e))?;
+    fs::copy(&current_ram_path, output_path)
+        .map_err(|e| format!("Failed to copy file to disk: {}", e))?;
+
+    let _ = fs::remove_file(&current_ram_path);
 
     log_progress("Done", "Completed download successfully.");
     Ok(())
